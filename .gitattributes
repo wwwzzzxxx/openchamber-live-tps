@@ -1,0 +1,4 @@
+# Normalized to LF everywhere: the built `*.js` files are committed, and a
+# CRLF checkout rewritten by the next `bun run build` would show every line
+# as modified.
+* text=auto eol=lf

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>实时</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--oc-fg, inherit);
+    background: transparent;
+    overflow: hidden;
+  }
+  #root { padding: 2px 0; }
+  .row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    line-height: 1.4;
+  }
+  .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--oc-muted, #888);
+    align-self: center;
+    flex: none;
+  }
+  .dot.live { background: var(--oc-primary, #888); animation: pulse 1s ease-in-out infinite; }
+  .dot.wait { background: transparent; border: 1px solid var(--oc-primary, #888); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .value {
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 17px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+  }
+  .unit { color: var(--oc-muted, #888); font-size: 11px; }
+  .spark {
+    margin-left: auto;
+    flex: none;
+    display: flex;
+    align-items: center;
+    color: var(--oc-primary, #888);
+  }
+  .spark-line { stroke: currentColor; }
+  .spark-area { fill: currentColor; opacity: 0.18; }
+  .muted { color: var(--oc-muted, #888); }
+  .meta {
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 11px;
+    color: var(--oc-muted, #888);
+    font-variant-numeric: tabular-nums;
+  }
+  .tag {
+    font-size: 10px;
+    border: 1px solid currentColor;
+    border-radius: 4px;
+    padding: 0 4px;
+    opacity: 0.8;
+    flex: none;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="main.js"></script>
+</body>
+</html>

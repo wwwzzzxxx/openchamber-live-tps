@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Live TPS</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--oc-fg, inherit);
+    background: transparent;
+    padding: 12px;
+  }
+  h1 { font-size: 13px; margin: 0 0 8px; }
+  .big {
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 34px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .big.muted { color: var(--oc-muted, #888); font-size: 20px; font-weight: 500; }
+  .unit { color: var(--oc-muted, #888); }
+  .spark { margin: 4px 0; color: var(--oc-primary, #888); display: flex; }
+  .spark-line { stroke: currentColor; }
+  .spark-area { fill: currentColor; opacity: 0.18; }
+  .muted { color: var(--oc-muted, #888); }
+  dl {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 12px;
+    margin: 12px 0 0;
+  }
+  dt { color: var(--oc-muted, #888); }
+  dd { margin: 0; font-family: var(--oc-mono, ui-monospace, Consolas, monospace); text-align: right; }
+  .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--oc-muted, #888); margin-right: 6px;
+  }
+  .dot.live { background: var(--oc-primary, #888); animation: pulse 1s ease-in-out infinite; }
+  .dot.wait { background: transparent; border: 1px solid var(--oc-primary, #888); }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  .note { margin-top: 12px; color: var(--oc-muted, #888); font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="main.js"></script>
+</body>
+</html>
