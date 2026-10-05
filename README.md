@@ -3,6 +3,8 @@
 A `实时` section for the Work Status panel: live generation speed for the open
 session, next to OpenChamber's own Turn stats.
 
+![The Work Status panel with the 实时 section showing 51.3 tok/s above Turn stats](docs/work-status.png)
+
 ## What it shows
 
 - **Row 1** — instant `tok/s` with a sparkline and a state dot (generating /
