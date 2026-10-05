@@ -49,12 +49,13 @@ const PROBE_TIMEOUT_MS = 2_000;
 /** Origin discovery is a handful of dials against the parent process; keep it off the hot retry path. */
 const DISCOVERY_INTERVAL_MS = 5_000;
 
-// Character-to-token ratios vary by model, language, and content. The default
-// approximates mixed text; completed steps recalibrate it from real token
-// counts. The clamp keeps a single odd step from skewing the meter.
-const DEFAULT_CHARS_PER_TOKEN = 0.25;
-const MIN_CHARS_PER_TOKEN = 0.05;
-const MAX_CHARS_PER_TOKEN = 1;
+// Tokens per streamed character. No tokenizer runs here — the stream is
+// characters, converted with this ratio. Ratios vary by model, language and
+// content, so completed steps recalibrate it from real token counts. The clamp
+// keeps a single odd step from skewing the meter.
+const DEFAULT_TOKENS_PER_CHAR = 0.25;
+const MIN_TOKENS_PER_CHAR = 0.05;
+const MAX_TOKENS_PER_CHAR = 1;
 const CALIBRATION_WEIGHT = 0.3;
 /** Ignore tiny settled steps when calibrating; they carry no signal. */
 const MIN_CALIBRATION_CHARS = 40;
@@ -103,7 +104,7 @@ type TurnPoint = { tps: number; at: number };
 type SessionMemory = {
   lastTurn: TurnResult | null;
   turns: TurnPoint[];
-  charsPerToken: number;
+  tokensPerChar: number;
   calibrated: boolean;
 };
 /** Finished-turn curve points kept per session. */
@@ -152,7 +153,7 @@ let lastEventAt = 0;
 /** Every parsed event on the stream, watched session or not, for diagnosis. */
 let eventsSeen = 0;
 let busy = false;
-let charsPerToken = DEFAULT_CHARS_PER_TOKEN;
+let tokensPerChar = DEFAULT_TOKENS_PER_CHAR;
 let calibrated = false;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
@@ -269,7 +270,7 @@ type SessionState = {
   deltaToolCalls: Set<string>;
   messageChars: Map<string, number>;
   busy: boolean;
-  charsPerToken: number;
+  tokensPerChar: number;
   calibrated: boolean;
   turnExecAt: number | null;
   turnStartedAt: number | null;
@@ -314,7 +315,7 @@ const createSessionState = (sessionId: string): SessionState => ({
   deltaToolCalls: new Set(),
   messageChars: new Map(),
   busy: false,
-  charsPerToken: DEFAULT_CHARS_PER_TOKEN,
+  tokensPerChar: DEFAULT_TOKENS_PER_CHAR,
   calibrated: false,
   turnExecAt: null,
   turnStartedAt: null,
@@ -391,7 +392,7 @@ const enterSession = (sessionId: string): void => {
   deltaToolCalls = state.deltaToolCalls;
   messageChars = state.messageChars;
   busy = state.busy;
-  charsPerToken = state.charsPerToken;
+  tokensPerChar = state.tokensPerChar;
   calibrated = state.calibrated;
   turnExecAt = state.turnExecAt;
   turnStartedAt = state.turnStartedAt;
@@ -427,7 +428,7 @@ const leaveSession = (): void => {
   state.deltaToolCalls = deltaToolCalls;
   state.messageChars = messageChars;
   state.busy = busy;
-  state.charsPerToken = charsPerToken;
+  state.tokensPerChar = tokensPerChar;
   state.calibrated = calibrated;
   state.turnExecAt = turnExecAt;
   state.turnStartedAt = turnStartedAt;
@@ -474,7 +475,7 @@ const statePaths = (): string[] => {
 const memoryOf = (state: SessionState): SessionMemory => ({
   lastTurn: state.lastTurn,
   turns: state.turns.slice(-TURNS_CAP),
-  charsPerToken: state.charsPerToken,
+  tokensPerChar: state.tokensPerChar,
   calibrated: state.calibrated,
 });
 
@@ -503,9 +504,14 @@ const readPersisted = (): void => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
-      state.charsPerToken = typeof memory.charsPerToken === 'number' && Number.isFinite(memory.charsPerToken)
-        ? memory.charsPerToken
-        : DEFAULT_CHARS_PER_TOKEN;
+      // `charsPerToken` was the pre-1.2 name for this ratio, and it really
+      // meant tokens per char. Keep reading it so a restart does not throw away
+      // a session's calibration.
+      const legacy = (raw as Record<string, unknown>).charsPerToken;
+      const savedRatio = memory.tokensPerChar ?? legacy;
+      state.tokensPerChar = typeof savedRatio === 'number' && Number.isFinite(savedRatio)
+        ? savedRatio
+        : DEFAULT_TOKENS_PER_CHAR;
       state.calibrated = memory.calibrated === true;
       sessionStates.set(id, state);
     }
@@ -741,7 +747,7 @@ const contributeStep = (step: StepRecord): StepContribution | null => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = step.chars * charsPerToken;
+    tokens = step.chars * tokensPerChar;
     real = false;
   } else {
     return null;
@@ -798,7 +804,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   // No measurable step (typically a late attach): estimate frozen at the last
   // counted character. Recomputed only when new characters arrive, so the
   // number holds instead of sagging while the model thinks.
-  if (turnChars === fbChars && charsPerToken === fbRatio && Number.isFinite(fbTps)) {
+  if (turnChars === fbChars && tokensPerChar === fbRatio && Number.isFinite(fbTps)) {
     return { tps: fbTps, source: 'estimate' };
   }
   const ref = turnLastCharAt ?? turnStartedAt;
@@ -814,7 +820,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   // and tool runs, so they are the honest denominator when the reconstruction
   // will not hold.
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(turnChars * charsPerToken, elapsedMs);
+  const tps = plausibleRate(turnChars * tokensPerChar, elapsedMs);
   if (tps === null) {
     // Nothing defensible to freeze: leave the cache empty rather than a number
     // that only looks like a measurement.
@@ -822,7 +828,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
     return null;
   }
   fbChars = turnChars;
-  fbRatio = charsPerToken;
+  fbRatio = tokensPerChar;
   fbTps = tps;
   return { tps, source: 'estimate' };
 };
@@ -859,7 +865,7 @@ const finalizeTurn = (now: number): void => {
     1,
     turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS),
   );
-  const tps = plausibleRate(turnChars * charsPerToken, activeMs);
+  const tps = plausibleRate(turnChars * tokensPerChar, activeMs);
   if (tps === null) {
     // The window cannot carry a number: keep the previous turn's average
     // rather than publishing one built on a clamped span.
@@ -869,7 +875,7 @@ const finalizeTurn = (now: number): void => {
   lastTurn = {
     tokensPerSecond: tps,
     source: 'estimate',
-    tokens: turnChars * charsPerToken,
+    tokens: turnChars * tokensPerChar,
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -986,8 +992,8 @@ const calibrate = (messageID: string, output: number, reasoning: number): void =
   if (chars < MIN_CALIBRATION_CHARS) return;
   const generated = output + reasoning;
   if (!Number.isFinite(generated) || generated <= 0) return;
-  const ratio = Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, generated / chars));
-  charsPerToken = charsPerToken + (ratio - charsPerToken) * CALIBRATION_WEIGHT;
+  const ratio = Math.min(MAX_TOKENS_PER_CHAR, Math.max(MIN_TOKENS_PER_CHAR, generated / chars));
+  tokensPerChar = tokensPerChar + (ratio - tokensPerChar) * CALIBRATION_WEIGHT;
   calibrated = true;
 };
 
@@ -1670,7 +1676,7 @@ const computeLive = (now: number): {
     // Not the headline, but a published field: a window whose samples all
     // landed in the same millisecond would otherwise report the same broken
     // rate the estimate path used to.
-    tps: Math.min((chars / (spanMs / 1000)) * charsPerToken, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min((chars / (spanMs / 1000)) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1703,7 +1709,7 @@ const liveBuckets = (now: number): number[] => {
     // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
     // normalizes by the largest point, so a single such bucket flattened every
     // other point on the curve.
-    out.push(Math.min((chars / (width / 1000)) * charsPerToken, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min((chars / (width / 1000)) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   // Trim leading silence so a fresh turn starts drawing immediately.
   let lead = 0;

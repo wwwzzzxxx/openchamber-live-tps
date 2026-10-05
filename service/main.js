@@ -18,9 +18,9 @@ var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
 var PROBE_TIMEOUT_MS = 2000;
 var DISCOVERY_INTERVAL_MS = 5000;
-var DEFAULT_CHARS_PER_TOKEN = 0.25;
-var MIN_CHARS_PER_TOKEN = 0.05;
-var MAX_CHARS_PER_TOKEN = 1;
+var DEFAULT_TOKENS_PER_CHAR = 0.25;
+var MIN_TOKENS_PER_CHAR = 0.05;
+var MAX_TOKENS_PER_CHAR = 1;
 var CALIBRATION_WEIGHT = 0.3;
 var MIN_CALIBRATION_CHARS = 40;
 var MAX_STREAM_GAP_MS = 1000;
@@ -43,7 +43,7 @@ var lastDiscoveryAt = 0;
 var lastEventAt = 0;
 var eventsSeen = 0;
 var busy = false;
-var charsPerToken = DEFAULT_CHARS_PER_TOKEN;
+var tokensPerChar = DEFAULT_TOKENS_PER_CHAR;
 var calibrated = false;
 var controller = null;
 var retryTimer = null;
@@ -100,7 +100,7 @@ var createSessionState = (sessionId) => ({
   deltaToolCalls: new Set,
   messageChars: new Map,
   busy: false,
-  charsPerToken: DEFAULT_CHARS_PER_TOKEN,
+  tokensPerChar: DEFAULT_TOKENS_PER_CHAR,
   calibrated: false,
   turnExecAt: null,
   turnStartedAt: null,
@@ -168,7 +168,7 @@ var enterSession = (sessionId) => {
   deltaToolCalls = state.deltaToolCalls;
   messageChars = state.messageChars;
   busy = state.busy;
-  charsPerToken = state.charsPerToken;
+  tokensPerChar = state.tokensPerChar;
   calibrated = state.calibrated;
   turnExecAt = state.turnExecAt;
   turnStartedAt = state.turnStartedAt;
@@ -203,7 +203,7 @@ var leaveSession = () => {
   state.deltaToolCalls = deltaToolCalls;
   state.messageChars = messageChars;
   state.busy = busy;
-  state.charsPerToken = charsPerToken;
+  state.tokensPerChar = tokensPerChar;
   state.calibrated = calibrated;
   state.turnExecAt = turnExecAt;
   state.turnStartedAt = turnStartedAt;
@@ -240,7 +240,7 @@ var statePaths = () => {
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
   turns: state.turns.slice(-TURNS_CAP),
-  charsPerToken: state.charsPerToken,
+  tokensPerChar: state.tokensPerChar,
   calibrated: state.calibrated
 });
 var readSessions = (file) => {
@@ -268,7 +268,9 @@ var readPersisted = () => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
-      state.charsPerToken = typeof memory.charsPerToken === "number" && Number.isFinite(memory.charsPerToken) ? memory.charsPerToken : DEFAULT_CHARS_PER_TOKEN;
+      const legacy = raw.charsPerToken;
+      const savedRatio = memory.tokensPerChar ?? legacy;
+      state.tokensPerChar = typeof savedRatio === "number" && Number.isFinite(savedRatio) ? savedRatio : DEFAULT_TOKENS_PER_CHAR;
       state.calibrated = memory.calibrated === true;
       sessionStates.set(id, state);
     }
@@ -443,7 +445,7 @@ var contributeStep = (step) => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = step.chars * charsPerToken;
+    tokens = step.chars * tokensPerChar;
     real = false;
   } else {
     return null;
@@ -490,7 +492,7 @@ var computeRunning = () => {
     return { tps: sum.tokens / (sum.netMs / 1000), source: sum.real ? "tokens" : "estimate" };
   if (turnStartedAt === null || turnChars === 0)
     return null;
-  if (turnChars === fbChars && charsPerToken === fbRatio && Number.isFinite(fbTps)) {
+  if (turnChars === fbChars && tokensPerChar === fbRatio && Number.isFinite(fbTps)) {
     return { tps: fbTps, source: "estimate" };
   }
   const ref = turnLastCharAt ?? turnStartedAt;
@@ -498,13 +500,13 @@ var computeRunning = () => {
   const frozenTool = turnToolMs + (toolStartAt !== null ? Math.max(0, ref - toolStartAt) : 0);
   const reconstructed = turnExecAt === null ? ref - turnStartedAt : ref - turnExecAt - frozenWait - frozenTool;
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(turnChars * charsPerToken, elapsedMs);
+  const tps = plausibleRate(turnChars * tokensPerChar, elapsedMs);
   if (tps === null) {
     fbTps = NaN;
     return null;
   }
   fbChars = turnChars;
-  fbRatio = charsPerToken;
+  fbRatio = tokensPerChar;
   fbTps = tps;
   return { tps, source: "estimate" };
 };
@@ -536,7 +538,7 @@ var finalizeTurn = (now) => {
     return;
   }
   const activeMs = Math.max(1, turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS));
-  const tps = plausibleRate(turnChars * charsPerToken, activeMs);
+  const tps = plausibleRate(turnChars * tokensPerChar, activeMs);
   if (tps === null) {
     clearTurn();
     return;
@@ -544,7 +546,7 @@ var finalizeTurn = (now) => {
   lastTurn = {
     tokensPerSecond: tps,
     source: "estimate",
-    tokens: turnChars * charsPerToken,
+    tokens: turnChars * tokensPerChar,
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -629,8 +631,8 @@ var calibrate = (messageID, output, reasoning) => {
   const generated = output + reasoning;
   if (!Number.isFinite(generated) || generated <= 0)
     return;
-  const ratio = Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, generated / chars));
-  charsPerToken = charsPerToken + (ratio - charsPerToken) * CALIBRATION_WEIGHT;
+  const ratio = Math.min(MAX_TOKENS_PER_CHAR, Math.max(MIN_TOKENS_PER_CHAR, generated / chars));
+  tokensPerChar = tokensPerChar + (ratio - tokensPerChar) * CALIBRATION_WEIGHT;
   calibrated = true;
 };
 var settleStep = (messageID, output, reasoning, now) => {
@@ -1250,7 +1252,7 @@ var computeLive = (now) => {
       textChars += sample.chars;
   }
   return {
-    tps: Math.min(chars / (spanMs / 1000) * charsPerToken, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min(chars / (spanMs / 1000) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1278,7 +1280,7 @@ var liveBuckets = (now) => {
       out.push(0);
       continue;
     }
-    out.push(Math.min(chars / (width / 1000) * charsPerToken, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min(chars / (width / 1000) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   let lead = 0;
   while (lead < out.length && out[lead] <= 0)

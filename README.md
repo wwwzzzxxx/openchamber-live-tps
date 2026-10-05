@@ -7,8 +7,8 @@ session, plus the last turn's average and time to first token.
 
 ![The Work Status panel with the Live TPS section showing 25.1 tok/s above Turn stats](docs/work-status.png)
 
-`tok/s` here is **text characters streamed per second divided by 1.5**, not
-provider-reported token counts. See [Counting](#counting).
+`tok/s` here is estimated from streamed characters and calibrated against
+provider-reported token counts — there is no tokenizer. See [Counting](#counting).
 
 ## What it shows
 
@@ -57,11 +57,25 @@ npm test   # 70 assertions, ~12s
 
 ## Counting
 
-The honest source would be the `usage` block each provider returns, but it is not
-available early enough: it arrives with the message end, so the running number
-could not be live. This extension counts **characters** instead, divided by `1.5`
-characters per token — the low end of the usual 1.5–4 range, so the number is
-closer to a floor than a peak.
+No tokenizer runs here. A real one would ship a vocabulary per model family into
+a bundle that has to load inside a sandboxed guest — and it would not help
+anyway, because the live number has to exist before the tokens do. The honest
+source would be the `usage` block each provider returns, but that arrives with
+the message end, too late to be live.
+
+So the stream is **characters**, converted to tokens with a ratio:
+
+- **The ratio starts at `0.25` tokens per character (4 characters per token)**,
+  the usual figure for English prose.
+- **Every finished step recalibrates it.** When the provider reports real token
+  counts, the ratio moves toward `generated tokens / streamed characters` — an
+  exponential average (weight `0.3`), clamped to `0.05`–`1` so a single odd step
+  cannot skew the meter. It is learned per session and persisted to disk, so the
+  live number converges on the model's actual ratio instead of staying on a
+  fixed guess.
+- **`last` prefers the real thing.** Provider-reported token counts replace the
+  estimate when they arrive, and the value is then labelled `measured`. The
+  character estimate is only the fallback, labelled `estimated`.
 
 It matters what those characters are. The stream carries `text` parts, `reasoning`
 parts, and tool-call JSON:
@@ -115,9 +129,11 @@ OpenChamber reports real numbers instead of `unreachable`.
 - A step that produced no measurable output contributes no time and no tokens —
   the average only covers spans where something was actually produced. A
   `reasoning` delta is only a share of output while the step has produced no text.
-- The live number converts characters with the fixed ratio, so it drifts from the
-  final `measured` average on models that emit tokens far from 1.5 characters
-  each. The two converge when the provider reports no token counts at all.
+- The live number converts characters with a learned ratio, so a brand-new
+  session starts from the `0.25` assumption and can drift from the final
+  `measured` average until its first real token counts arrive and recalibrate it.
+  A provider that never reports token counts stays on the estimate, labelled
+  `estimated`.
 
 ## License
 
