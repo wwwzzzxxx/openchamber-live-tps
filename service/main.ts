@@ -19,6 +19,9 @@
 // `POST /watch`, then polls `GET /rate`. The service never reaches the browser
 // and the page never dials this process directly.
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -95,7 +98,7 @@ type TurnResult = {
 
 type WaitingKind = 'permission' | 'question';
 
-/** Per-session memory kept across watch switches. */
+/** A session's durable numbers, as written to disk and read back on startup. */
 type TurnPoint = { tps: number; at: number };
 type SessionMemory = {
   lastTurn: TurnResult | null;
@@ -109,17 +112,23 @@ const TURNS_CAP = 30;
 const SESSIONS_CAP = 20;
 /** Live buckets drawn for the current window. */
 const CURVE_BUCKETS = 12;
-const sessionMemory = new Map<string, SessionMemory>();
+/** How long a change waits before it is written, so a burst of events coalesces. */
+const PERSIST_DEBOUNCE_MS = 1_500;
+/** On-disk schema version; a mismatch discards the file instead of guessing. */
+const PERSIST_VERSION = 1;
 
-const samples: Sample[] = [];
+// Collection-valued state is `let` rather than `const`: `enterSession` swaps the
+// reference to the one belonging to the session being processed, so mutations
+// land in that session's own record. See `SessionState` below.
+let samples: Sample[] = [];
 /** Characters seen per part id, used to diff `session.text.ended` / `session.reasoning.ended` snapshots. */
-const partChars = new Map<string, number>();
+let partChars = new Map<string, number>();
 /** Parts already counted through streaming deltas, never diffed again. */
-const deltaParts = new Set<string>();
+let deltaParts = new Set<string>();
 /** Tool-input fragments already counted through input deltas, never diffed again. */
-const deltaToolCalls = new Set<string>();
+let deltaToolCalls = new Set<string>();
 /** Characters seen per assistant message id, used to calibrate tokens per character. */
-const messageChars = new Map<string, number>();
+let messageChars = new Map<string, number>();
 
 let watch: WatchConfig | null = null;
 let connection: ConnectionState = 'idle';
@@ -168,7 +177,7 @@ let turnActiveMs = 0;
 let turnWaitMs = 0;
 let waitStartAt: number | null = null;
 /** Tool calls in flight (plus shell executions): generation is paused while non-empty. */
-const activeToolIds = new Set<string>();
+let activeToolIds = new Set<string>();
 let turnToolMs = 0;
 let toolStartAt: number | null = null;
 
@@ -197,11 +206,11 @@ type StepRecord = {
   toolOpen: number;
   toolSince: number | null;
 };
-const steps = new Map<string, StepRecord>();
+let steps = new Map<string, StepRecord>();
 /** Step ids seen in this turn, in arrival order. */
 let turnStepOrder: string[] = [];
 /** In-flight tool key -> step id it belongs to (`''` when unattributable). */
-const pendingToolStep = new Map<string, string>();
+let pendingToolStep = new Map<string, string>();
 /** Frozen-estimate cache: recomputed only when new characters arrive. */
 let fbChars = -1;
 let fbRatio = NaN;
@@ -210,8 +219,8 @@ let lastTurn: TurnResult | null = null;
 // Pending permission and question requests for the watched session. OpenCode
 // keeps the session `busy` while an agent waits for the user; these sets are
 // what distinguishes generation from waiting.
-const pendingPermissions = new Set<string>();
-const pendingQuestions = new Set<string>();
+let pendingPermissions = new Set<string>();
+let pendingQuestions = new Set<string>();
 
 const waitingKind = (): WaitingKind | null => (
   pendingPermissions.size > 0 ? 'permission' : pendingQuestions.size > 0 ? 'question' : null
@@ -235,51 +244,328 @@ const clearTurn = (): void => {
   turnStepOrder = [];
 };
 
-const resetMeasurement = (): void => {
-  samples.length = 0;
-  partChars.clear();
-  deltaParts.clear();
-  deltaToolCalls.clear();
-  messageChars.clear();
-  lastEventAt = 0;
-  busy = false;
-  charsPerToken = DEFAULT_CHARS_PER_TOKEN;
-  calibrated = false;
-  clearTurn();
-  pendingPermissions.clear();
-  pendingQuestions.clear();
-  activeToolIds.clear();
-  pendingToolStep.clear();
-  steps.clear();
-  lastTurn = null;
-  turns.length = 0;
-};
-
 /** Finished-turn curve of the watched session, oldest first. */
 let turns: TurnPoint[] = [];
 
-const stashSession = (sessionId: string | null): void => {
-  if (!sessionId) return;
-  sessionMemory.set(sessionId, {
-    lastTurn,
-    turns: turns.slice(-TURNS_CAP),
-    charsPerToken,
-    calibrated,
-  });
-  while (sessionMemory.size > SESSIONS_CAP) {
-    const oldest = sessionMemory.keys().next();
-    if (oldest.done) break;
-    sessionMemory.delete(oldest.value);
+/**
+ * Everything the measurement keeps for one session.
+ *
+ * The service reads one global event stream that carries every session at once,
+ * and more than one status page can be asking about a different session at the
+ * same time — two windows, or a window with a second surface open. These fields
+ * used to live in module-level variables, so the second caller reset the first
+ * one's in-progress turn and dropped the shared SSE connection on every watch.
+ * They live in a per-session record now; the module-level variables are only
+ * the register `enterSession` loads the active record into, which is why the
+ * rest of this file did not have to change.
+ */
+type SessionState = {
+  sessionId: string;
+  /** Last time this record was touched; drives the tracked-session cap. */
+  lastSeenAt: number;
+  samples: Sample[];
+  partChars: Map<string, number>;
+  deltaParts: Set<string>;
+  deltaToolCalls: Set<string>;
+  messageChars: Map<string, number>;
+  busy: boolean;
+  charsPerToken: number;
+  calibrated: boolean;
+  turnExecAt: number | null;
+  turnStartedAt: number | null;
+  turnLastCharAt: number | null;
+  turnChars: number;
+  turnReasoningChars: number;
+  turnActiveMs: number;
+  turnWaitMs: number;
+  waitStartAt: number | null;
+  activeToolIds: Set<string>;
+  turnToolMs: number;
+  toolStartAt: number | null;
+  steps: Map<string, StepRecord>;
+  turnStepOrder: string[];
+  pendingToolStep: Map<string, string>;
+  fbChars: number;
+  fbRatio: number;
+  fbTps: number;
+  lastTurn: TurnResult | null;
+  turns: TurnPoint[];
+  pendingPermissions: Set<string>;
+  pendingQuestions: Set<string>;
+};
+
+const sessionStates = new Map<string, SessionState>();
+/**
+ * Sessions a page has asked about **in this process**. Kept apart from
+ * `sessionStates`, which also holds records restored from disk: `/rate` reports
+ * `sessionId` from this set, so a page polls until it has watched again and
+ * the stream gets started after a restart.
+ */
+const watched = new Set<string>();
+/** How many sessions keep a record at once; the least recently touched goes. */
+const TRACKED_CAP = SESSIONS_CAP;
+
+const createSessionState = (sessionId: string): SessionState => ({
+  sessionId,
+  lastSeenAt: Date.now(),
+  samples: [],
+  partChars: new Map(),
+  deltaParts: new Set(),
+  deltaToolCalls: new Set(),
+  messageChars: new Map(),
+  busy: false,
+  charsPerToken: DEFAULT_CHARS_PER_TOKEN,
+  calibrated: false,
+  turnExecAt: null,
+  turnStartedAt: null,
+  turnLastCharAt: null,
+  turnChars: 0,
+  turnReasoningChars: 0,
+  turnActiveMs: 0,
+  turnWaitMs: 0,
+  waitStartAt: null,
+  activeToolIds: new Set(),
+  turnToolMs: 0,
+  toolStartAt: null,
+  steps: new Map(),
+  turnStepOrder: [],
+  pendingToolStep: new Map(),
+  fbChars: -1,
+  fbRatio: NaN,
+  fbTps: NaN,
+  lastTurn: null,
+  turns: [],
+  pendingPermissions: new Set(),
+  pendingQuestions: new Set(),
+});
+
+/** The record the module-level variables currently mirror. */
+let activeSession: SessionState = createSessionState('');
+/** Session mirrored by the module-level variables, or null outside a session. */
+let activeSessionId: string | null = null;
+let inSession = false;
+
+const trimSessionStates = (): void => {
+  while (sessionStates.size > TRACKED_CAP) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const [key, value] of sessionStates) {
+      if (key === activeSessionId || key === watch?.sessionId) continue;
+      if (value.lastSeenAt < oldestAt) {
+        oldestAt = value.lastSeenAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === null) break;
+    sessionStates.delete(oldestKey);
   }
 };
 
-const loadSession = (sessionId: string | null): void => {
-  const saved = sessionId ? sessionMemory.get(sessionId) : undefined;
-  if (!saved) return;
-  lastTurn = saved.lastTurn;
-  turns = saved.turns.slice(-TURNS_CAP);
-  charsPerToken = saved.charsPerToken;
-  calibrated = saved.calibrated;
+const trackSession = (sessionId: string): SessionState => {
+  const existing = sessionStates.get(sessionId);
+  if (existing) {
+    existing.lastSeenAt = Date.now();
+    return existing;
+  }
+  const created = createSessionState(sessionId);
+  sessionStates.set(sessionId, created);
+  trimSessionStates();
+  return created;
+};
+
+/**
+ * Load `sessionId`'s record into the module-level variables. Everything read
+ * and written between `enterSession` and `leaveSession` belongs to that
+ * session. The two never nest: the stream delivers one event at a time and
+ * `/rate` answers without awaiting, so there is no `await` to interleave them.
+ */
+const enterSession = (sessionId: string): void => {
+  if (inSession) throw new Error('enterSession called while already inside a session');
+  const state = trackSession(sessionId);
+  activeSession = state;
+  activeSessionId = sessionId;
+  inSession = true;
+  samples = state.samples;
+  partChars = state.partChars;
+  deltaParts = state.deltaParts;
+  deltaToolCalls = state.deltaToolCalls;
+  messageChars = state.messageChars;
+  busy = state.busy;
+  charsPerToken = state.charsPerToken;
+  calibrated = state.calibrated;
+  turnExecAt = state.turnExecAt;
+  turnStartedAt = state.turnStartedAt;
+  turnLastCharAt = state.turnLastCharAt;
+  turnChars = state.turnChars;
+  turnReasoningChars = state.turnReasoningChars;
+  turnActiveMs = state.turnActiveMs;
+  turnWaitMs = state.turnWaitMs;
+  waitStartAt = state.waitStartAt;
+  activeToolIds = state.activeToolIds;
+  turnToolMs = state.turnToolMs;
+  toolStartAt = state.toolStartAt;
+  steps = state.steps;
+  turnStepOrder = state.turnStepOrder;
+  pendingToolStep = state.pendingToolStep;
+  fbChars = state.fbChars;
+  fbRatio = state.fbRatio;
+  fbTps = state.fbTps;
+  lastTurn = state.lastTurn;
+  turns = state.turns;
+  pendingPermissions = state.pendingPermissions;
+  pendingQuestions = state.pendingQuestions;
+};
+
+/** Copy the register back into the record it was loaded from. */
+const leaveSession = (): void => {
+  if (!inSession) return;
+  const state = activeSession;
+  state.lastSeenAt = Date.now();
+  state.samples = samples;
+  state.partChars = partChars;
+  state.deltaParts = deltaParts;
+  state.deltaToolCalls = deltaToolCalls;
+  state.messageChars = messageChars;
+  state.busy = busy;
+  state.charsPerToken = charsPerToken;
+  state.calibrated = calibrated;
+  state.turnExecAt = turnExecAt;
+  state.turnStartedAt = turnStartedAt;
+  state.turnLastCharAt = turnLastCharAt;
+  state.turnChars = turnChars;
+  state.turnReasoningChars = turnReasoningChars;
+  state.turnActiveMs = turnActiveMs;
+  state.turnWaitMs = turnWaitMs;
+  state.waitStartAt = waitStartAt;
+  state.activeToolIds = activeToolIds;
+  state.turnToolMs = turnToolMs;
+  state.toolStartAt = toolStartAt;
+  state.steps = steps;
+  state.turnStepOrder = turnStepOrder;
+  state.pendingToolStep = pendingToolStep;
+  state.fbChars = fbChars;
+  state.fbRatio = fbRatio;
+  state.fbTps = fbTps;
+  state.lastTurn = lastTurn;
+  state.turns = turns;
+  state.pendingPermissions = pendingPermissions;
+  state.pendingQuestions = pendingQuestions;
+  inSession = false;
+  activeSessionId = null;
+};
+
+/**
+ * Where the durable numbers live.
+ *
+ * Beside the service itself so a git-installed extension keeps them across a
+ * restart without writing into anything tracked (the file is gitignored), with
+ * `OPENCHAMBER_LIVE_TPS_STATE` overriding it — the smoke test points that at a
+ * scratch path so runs cannot leak into each other. A directory the process
+ * cannot write falls back to the temp dir instead of failing startup.
+ */
+const statePaths = (): string[] => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  if (override) return [override];
+  const entry = process.argv[1];
+  const beside = entry ? path.dirname(entry) : process.cwd();
+  return [path.join(beside, '.live-tps-state.json'), path.join(os.tmpdir(), 'openchamber-live-tps-state.json')];
+};
+
+const memoryOf = (state: SessionState): SessionMemory => ({
+  lastTurn: state.lastTurn,
+  turns: state.turns.slice(-TURNS_CAP),
+  charsPerToken: state.charsPerToken,
+  calibrated: state.calibrated,
+});
+
+/** Restore durable numbers so a restarted service answers immediately. */
+const readPersisted = (): void => {
+  for (const file of statePaths()) {
+    let parsed: { version?: unknown; sessions?: unknown } | null = null;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { version?: unknown; sessions?: unknown };
+    } catch {
+      continue;
+    }
+    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions) continue;
+    for (const [id, raw] of Object.entries(parsed.sessions as Record<string, unknown>)) {
+      if (!id || !raw || typeof raw !== 'object') continue;
+      const memory = raw as Partial<SessionMemory>;
+      const state = createSessionState(id);
+      state.lastTurn = memory.lastTurn ?? null;
+      state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
+      state.charsPerToken = typeof memory.charsPerToken === 'number' && Number.isFinite(memory.charsPerToken)
+        ? memory.charsPerToken
+        : DEFAULT_CHARS_PER_TOKEN;
+      state.calibrated = memory.calibrated === true;
+      sessionStates.set(id, state);
+    }
+    return;
+  }
+};
+
+let persistTimer: NodeJS.Timeout | null = null;
+let persistDirty = false;
+
+const writePersisted = (): void => {
+  const sessions: Record<string, SessionMemory> = {};
+  for (const [id, state] of sessionStates) sessions[id] = memoryOf(state);
+  const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+  for (const file of statePaths()) {
+    try {
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, payload, 'utf8');
+      fs.renameSync(tmp, file);
+      return;
+    } catch {
+      // Read-only extension folder: try the next path, and if none works the
+      // numbers simply start fresh next time. Losing history is better than
+      // losing the service.
+    }
+  }
+};
+
+const flushPersist = (): void => {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (!persistDirty) return;
+  persistDirty = false;
+  writePersisted();
+};
+
+/** Coalesce writes: a turn's worth of events must not become disk traffic. */
+const schedulePersist = (): void => {
+  persistDirty = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+  persistTimer.unref?.();
+};
+
+/**
+ * Drop everything still in flight once the stream is back.
+ *
+ * A turn's closing events were sent while we were disconnected, so they are
+ * gone for good: leaving `busy` or an open step behind would freeze the panel
+ * on "generating" forever. Finished work — `lastTurn`, `turns` — is untouched,
+ * which is the part worth keeping. This replaces the reset that a watch change
+ * used to perform as a side effect.
+ */
+const resetInFlight = (): void => {
+  if (inSession) return;
+  for (const id of [...sessionStates.keys()]) {
+    enterSession(id);
+    clearTurn();
+    busy = false;
+    activeToolIds.clear();
+    pendingToolStep.clear();
+    pendingPermissions.clear();
+    pendingQuestions.clear();
+    waitStartAt = null;
+    toolStartAt = null;
+    leaveSession();
+  }
 };
 
 const turnTtftMs = (): number | null => (
@@ -542,6 +828,7 @@ const finalizeTurn = (now: number): void => {
     };
     turns.push({ tps: lastTurn.tokensPerSecond, at: now });
     if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
+    schedulePersist();
     clearTurn();
     return;
   }
@@ -574,6 +861,7 @@ const finalizeTurn = (now: number): void => {
   };
   turns.push({ tps: lastTurn.tokensPerSecond, at: now });
   if (turns.length > TURNS_CAP) turns.splice(0, turns.length - TURNS_CAP);
+  schedulePersist();
   clearTurn();
 };
 
@@ -626,8 +914,13 @@ const recordChars = (messageID: string, partID: string, kind: Sample['kind'], ch
   }
 };
 
+/**
+ * True when `sessionID` is the session the module-level variables mirror.
+ * `handleEvent` enters that session before dispatching, so this stays a plain
+ * equality check and the twenty-odd call sites inside the switch never change.
+ */
 const isWatchedSession = (sessionID: unknown): boolean => (
-  typeof sessionID === 'string' && watch !== null && watch.sessionId !== null && sessionID === watch.sessionId
+  typeof sessionID === 'string' && activeSessionId !== null && sessionID === activeSessionId
 );
 
 const readString = (value: unknown): string => (typeof value === 'string' ? value : '');
@@ -701,7 +994,36 @@ const settleStep = (messageID: string, output: number, reasoning: number, now: n
 
 type RawEvent = { type?: unknown; data?: unknown; properties?: unknown };
 
+/** Session an event belongs to: `sessionID` in `data` (2.x) / `properties` (1.x), or under `form`. */
+const eventSessionID = (event: RawEvent): string | null => {
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  if (!payload) return null;
+  const direct = readString(payload.sessionID);
+  if (direct) return direct;
+  const form = readRecord(payload.form);
+  return form ? readString(form.sessionID) : '';
+};
+
+/**
+ * Route an event into its own session's record.
+ *
+ * The stream carries every session at once and the pages watching different
+ * sessions must not disturb each other, so the session is entered for the
+ * duration of the dispatch and left afterwards. Only sessions a page asked
+ * about are tracked, which bounds the map by the pages actually open.
+ */
 const handleEvent = (event: RawEvent, now: number): void => {
+  const sessionId = eventSessionID(event);
+  if (!sessionId || !sessionStates.has(sessionId)) return;
+  enterSession(sessionId);
+  try {
+    dispatchEvent(event, now);
+  } finally {
+    leaveSession();
+  }
+};
+
+const dispatchEvent = (event: RawEvent, now: number): void => {
   const type = normType(readString(event.type));
   if (!type) return;
   // OpenCode 2 carries fields in `data`; the 1.x shapes used `properties`.
@@ -1242,6 +1564,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
     retryDelay = RETRY_BASE_MS;
     lastEventAt = Date.now();
     eventsSeen = 0;
+    resetInFlight();
 
     try {
       const decoder = new TextDecoder();
@@ -1395,18 +1718,27 @@ const isHttpOrigin = (value: string): boolean => {
   }
 };
 
+/**
+ * Record what a page asked to watch.
+ *
+ * Registering a session never touches the measurement: its record either
+ * already exists or starts empty, and nothing belonging to another session is
+ * reset or dropped. Only a change of origin restarts the stream — the endpoint
+ * is the server's global one, so swapping sessions needs no reconnect, and
+ * reconnecting on every watch is what used to tear down a connection another
+ * page was relying on.
+ */
 const applyWatch = (next: WatchConfig): boolean => {
-  const changed = watch === null
-    || watch.origin !== next.origin
-    || watch.sessionId !== next.sessionId;
-  if (!changed) return false;
+  const originChanged = watch === null || watch.origin !== next.origin;
   // A new page origin is a new host: whatever we learned about the old one's
   // loopback says nothing about this one.
-  if (watch === null || watch.origin !== next.origin) serverOrigin = null;
-  stashSession(watch?.sessionId ?? null);
+  if (originChanged) serverOrigin = null;
   watch = next;
-  resetMeasurement();
-  loadSession(next.sessionId);
+  if (next.sessionId) {
+    watched.add(next.sessionId);
+    trackSession(next.sessionId);
+  }
+  if (!originChanged) return false;
   retryDelay = RETRY_BASE_MS;
   stopStream();
   beginStream();
@@ -1466,7 +1798,11 @@ const server = http.createServer((req, res) => {
         return;
       }
       const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId : null;
-      const changed = applyWatch({ origin, sessionId });
+      // `changed` still means "you were not already set up for this": a new
+      // session counts, an origin switch counts, a repeat does not. It no
+      // longer implies the stream was rebuilt — only an origin change does.
+      const fresh = sessionId !== null && !watched.has(sessionId);
+      const changed = applyWatch({ origin, sessionId }) || fresh;
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
@@ -1476,35 +1812,51 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/rate') {
     const now = Date.now();
-    const live = computeLive(now);
-    json(res, 200, {
-      connection,
-      error: lastError,
-      errorKind: lastErrorKind,
-      sessionId: watch?.sessionId ?? null,
-      busy,
-      waiting: waitingKind(),
-      toolActive: toolActive(),
-      calibrated,
-      live,
-      running: turnStartedAt !== null ? computeRunning() : null,
-      curve: computeCurve(now),
-      turn: {
-        active: turnStartedAt !== null,
-        ttftMs: liveTtftMs(),
-      },
-      lastTurn,
-      eventsSeen,
-    });
+    // A page names its own session so two pages watching different sessions
+    // each read their own record. Without the parameter the most recent watch
+    // answers, which is what a one-page install has always seen.
+    const requested = readString(url.searchParams.get('sessionId')) || watch?.sessionId || null;
+    if (requested !== null) enterSession(requested);
+    let body: Record<string, unknown>;
+    try {
+      body = {
+        connection,
+        error: lastError,
+        errorKind: lastErrorKind,
+        // Nothing has watched this session in this process, so say so and the
+        // page re-asserts — that is how a service that just came back up gets
+        // its stream started again. The numbers are still answered from disk,
+        // so the panel shows last turn straight away instead of going blank.
+        sessionId: requested !== null && watched.has(requested) ? requested : null,
+        busy,
+        waiting: waitingKind(),
+        toolActive: toolActive(),
+        calibrated,
+        live: computeLive(now),
+        running: turnStartedAt !== null ? computeRunning() : null,
+        curve: computeCurve(now),
+        turn: {
+          active: turnStartedAt !== null,
+          ttftMs: liveTtftMs(),
+        },
+        lastTurn,
+        eventsSeen,
+      };
+    } finally {
+      if (requested !== null) leaveSession();
+    }
+    json(res, 200, body);
     return;
   }
 
   json(res, 404, { error: 'not-found' });
 });
 
+readPersisted();
 server.listen(port, '127.0.0.1');
 
 const shutdown = (): void => {
+  flushPersist();
   stopStream();
   server.close(() => process.exit(0));
 };

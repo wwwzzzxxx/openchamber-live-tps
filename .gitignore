@@ -1,3 +1,7 @@
 node_modules/
 index.ts
 shell-marker.txt
+# Service state: last turn and curve, written beside the service so a restart
+# still shows numbers. Never tracked — a git install must stay clean.
+.live-tps-state.json
+.live-tps-state.json.*.tmp

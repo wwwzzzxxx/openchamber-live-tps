@@ -1,5 +1,8 @@
 // service/main.ts
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var execFileAsync = promisify(execFile);
@@ -24,7 +27,8 @@ var MAX_STREAM_GAP_MS = 1000;
 var TURNS_CAP = 30;
 var SESSIONS_CAP = 20;
 var CURVE_BUCKETS = 12;
-var sessionMemory = new Map;
+var PERSIST_DEBOUNCE_MS = 1500;
+var PERSIST_VERSION = 1;
 var samples = [];
 var partChars = new Map;
 var deltaParts = new Set;
@@ -83,50 +87,234 @@ var clearTurn = () => {
     steps.delete(id);
   turnStepOrder = [];
 };
-var resetMeasurement = () => {
-  samples.length = 0;
-  partChars.clear();
-  deltaParts.clear();
-  deltaToolCalls.clear();
-  messageChars.clear();
-  lastEventAt = 0;
-  busy = false;
-  charsPerToken = DEFAULT_CHARS_PER_TOKEN;
-  calibrated = false;
-  clearTurn();
-  pendingPermissions.clear();
-  pendingQuestions.clear();
-  activeToolIds.clear();
-  pendingToolStep.clear();
-  steps.clear();
-  lastTurn = null;
-  turns.length = 0;
-};
 var turns = [];
-var stashSession = (sessionId) => {
-  if (!sessionId)
-    return;
-  sessionMemory.set(sessionId, {
-    lastTurn,
-    turns: turns.slice(-TURNS_CAP),
-    charsPerToken,
-    calibrated
-  });
-  while (sessionMemory.size > SESSIONS_CAP) {
-    const oldest = sessionMemory.keys().next();
-    if (oldest.done)
+var sessionStates = new Map;
+var watched = new Set;
+var TRACKED_CAP = SESSIONS_CAP;
+var createSessionState = (sessionId) => ({
+  sessionId,
+  lastSeenAt: Date.now(),
+  samples: [],
+  partChars: new Map,
+  deltaParts: new Set,
+  deltaToolCalls: new Set,
+  messageChars: new Map,
+  busy: false,
+  charsPerToken: DEFAULT_CHARS_PER_TOKEN,
+  calibrated: false,
+  turnExecAt: null,
+  turnStartedAt: null,
+  turnLastCharAt: null,
+  turnChars: 0,
+  turnReasoningChars: 0,
+  turnActiveMs: 0,
+  turnWaitMs: 0,
+  waitStartAt: null,
+  activeToolIds: new Set,
+  turnToolMs: 0,
+  toolStartAt: null,
+  steps: new Map,
+  turnStepOrder: [],
+  pendingToolStep: new Map,
+  fbChars: -1,
+  fbRatio: NaN,
+  fbTps: NaN,
+  lastTurn: null,
+  turns: [],
+  pendingPermissions: new Set,
+  pendingQuestions: new Set
+});
+var activeSession = createSessionState("");
+var activeSessionId = null;
+var inSession = false;
+var trimSessionStates = () => {
+  while (sessionStates.size > TRACKED_CAP) {
+    let oldestKey = null;
+    let oldestAt = Infinity;
+    for (const [key, value] of sessionStates) {
+      if (key === activeSessionId || key === watch?.sessionId)
+        continue;
+      if (value.lastSeenAt < oldestAt) {
+        oldestAt = value.lastSeenAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey === null)
       break;
-    sessionMemory.delete(oldest.value);
+    sessionStates.delete(oldestKey);
   }
 };
-var loadSession = (sessionId) => {
-  const saved = sessionId ? sessionMemory.get(sessionId) : undefined;
-  if (!saved)
+var trackSession = (sessionId) => {
+  const existing = sessionStates.get(sessionId);
+  if (existing) {
+    existing.lastSeenAt = Date.now();
+    return existing;
+  }
+  const created = createSessionState(sessionId);
+  sessionStates.set(sessionId, created);
+  trimSessionStates();
+  return created;
+};
+var enterSession = (sessionId) => {
+  if (inSession)
+    throw new Error("enterSession called while already inside a session");
+  const state = trackSession(sessionId);
+  activeSession = state;
+  activeSessionId = sessionId;
+  inSession = true;
+  samples = state.samples;
+  partChars = state.partChars;
+  deltaParts = state.deltaParts;
+  deltaToolCalls = state.deltaToolCalls;
+  messageChars = state.messageChars;
+  busy = state.busy;
+  charsPerToken = state.charsPerToken;
+  calibrated = state.calibrated;
+  turnExecAt = state.turnExecAt;
+  turnStartedAt = state.turnStartedAt;
+  turnLastCharAt = state.turnLastCharAt;
+  turnChars = state.turnChars;
+  turnReasoningChars = state.turnReasoningChars;
+  turnActiveMs = state.turnActiveMs;
+  turnWaitMs = state.turnWaitMs;
+  waitStartAt = state.waitStartAt;
+  activeToolIds = state.activeToolIds;
+  turnToolMs = state.turnToolMs;
+  toolStartAt = state.toolStartAt;
+  steps = state.steps;
+  turnStepOrder = state.turnStepOrder;
+  pendingToolStep = state.pendingToolStep;
+  fbChars = state.fbChars;
+  fbRatio = state.fbRatio;
+  fbTps = state.fbTps;
+  lastTurn = state.lastTurn;
+  turns = state.turns;
+  pendingPermissions = state.pendingPermissions;
+  pendingQuestions = state.pendingQuestions;
+};
+var leaveSession = () => {
+  if (!inSession)
     return;
-  lastTurn = saved.lastTurn;
-  turns = saved.turns.slice(-TURNS_CAP);
-  charsPerToken = saved.charsPerToken;
-  calibrated = saved.calibrated;
+  const state = activeSession;
+  state.lastSeenAt = Date.now();
+  state.samples = samples;
+  state.partChars = partChars;
+  state.deltaParts = deltaParts;
+  state.deltaToolCalls = deltaToolCalls;
+  state.messageChars = messageChars;
+  state.busy = busy;
+  state.charsPerToken = charsPerToken;
+  state.calibrated = calibrated;
+  state.turnExecAt = turnExecAt;
+  state.turnStartedAt = turnStartedAt;
+  state.turnLastCharAt = turnLastCharAt;
+  state.turnChars = turnChars;
+  state.turnReasoningChars = turnReasoningChars;
+  state.turnActiveMs = turnActiveMs;
+  state.turnWaitMs = turnWaitMs;
+  state.waitStartAt = waitStartAt;
+  state.activeToolIds = activeToolIds;
+  state.turnToolMs = turnToolMs;
+  state.toolStartAt = toolStartAt;
+  state.steps = steps;
+  state.turnStepOrder = turnStepOrder;
+  state.pendingToolStep = pendingToolStep;
+  state.fbChars = fbChars;
+  state.fbRatio = fbRatio;
+  state.fbTps = fbTps;
+  state.lastTurn = lastTurn;
+  state.turns = turns;
+  state.pendingPermissions = pendingPermissions;
+  state.pendingQuestions = pendingQuestions;
+  inSession = false;
+  activeSessionId = null;
+};
+var statePaths = () => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  if (override)
+    return [override];
+  const entry = process.argv[1];
+  const beside = entry ? path.dirname(entry) : process.cwd();
+  return [path.join(beside, ".live-tps-state.json"), path.join(os.tmpdir(), "openchamber-live-tps-state.json")];
+};
+var memoryOf = (state) => ({
+  lastTurn: state.lastTurn,
+  turns: state.turns.slice(-TURNS_CAP),
+  charsPerToken: state.charsPerToken,
+  calibrated: state.calibrated
+});
+var readPersisted = () => {
+  for (const file of statePaths()) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
+      continue;
+    for (const [id, raw] of Object.entries(parsed.sessions)) {
+      if (!id || !raw || typeof raw !== "object")
+        continue;
+      const memory = raw;
+      const state = createSessionState(id);
+      state.lastTurn = memory.lastTurn ?? null;
+      state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
+      state.charsPerToken = typeof memory.charsPerToken === "number" && Number.isFinite(memory.charsPerToken) ? memory.charsPerToken : DEFAULT_CHARS_PER_TOKEN;
+      state.calibrated = memory.calibrated === true;
+      sessionStates.set(id, state);
+    }
+    return;
+  }
+};
+var persistTimer = null;
+var persistDirty = false;
+var writePersisted = () => {
+  const sessions = {};
+  for (const [id, state] of sessionStates)
+    sessions[id] = memoryOf(state);
+  const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+  for (const file of statePaths()) {
+    try {
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, payload, "utf8");
+      fs.renameSync(tmp, file);
+      return;
+    } catch {}
+  }
+};
+var flushPersist = () => {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (!persistDirty)
+    return;
+  persistDirty = false;
+  writePersisted();
+};
+var schedulePersist = () => {
+  persistDirty = true;
+  if (persistTimer)
+    return;
+  persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+  persistTimer.unref?.();
+};
+var resetInFlight = () => {
+  if (inSession)
+    return;
+  for (const id of [...sessionStates.keys()]) {
+    enterSession(id);
+    clearTurn();
+    busy = false;
+    activeToolIds.clear();
+    pendingToolStep.clear();
+    pendingPermissions.clear();
+    pendingQuestions.clear();
+    waitStartAt = null;
+    toolStartAt = null;
+    leaveSession();
+  }
 };
 var turnTtftMs = () => turnExecAt !== null && turnStartedAt !== null ? Math.max(0, turnStartedAt - turnExecAt) : null;
 var liveTtftMs = () => {
@@ -326,6 +514,7 @@ var finalizeTurn = (now) => {
     turns.push({ tps: lastTurn.tokensPerSecond, at: now });
     if (turns.length > TURNS_CAP)
       turns.splice(0, turns.length - TURNS_CAP);
+    schedulePersist();
     clearTurn();
     return;
   }
@@ -352,6 +541,7 @@ var finalizeTurn = (now) => {
   turns.push({ tps: lastTurn.tokensPerSecond, at: now });
   if (turns.length > TURNS_CAP)
     turns.splice(0, turns.length - TURNS_CAP);
+  schedulePersist();
   clearTurn();
 };
 var pruneSamples = (now) => {
@@ -400,7 +590,7 @@ var recordChars = (messageID, partID, kind, chars, now) => {
     }
   }
 };
-var isWatchedSession = (sessionID) => typeof sessionID === "string" && watch !== null && watch.sessionId !== null && sessionID === watch.sessionId;
+var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
 var readString = (value) => typeof value === "string" ? value : "";
 var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
 var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -443,7 +633,28 @@ var settleStep = (messageID, output, reasoning, now) => {
     step.endAt = now;
   closeStepTool(step, now);
 };
+var eventSessionID = (event) => {
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  if (!payload)
+    return null;
+  const direct = readString(payload.sessionID);
+  if (direct)
+    return direct;
+  const form = readRecord(payload.form);
+  return form ? readString(form.sessionID) : "";
+};
 var handleEvent = (event, now) => {
+  const sessionId = eventSessionID(event);
+  if (!sessionId || !sessionStates.has(sessionId))
+    return;
+  enterSession(sessionId);
+  try {
+    dispatchEvent(event, now);
+  } finally {
+    leaveSession();
+  }
+};
+var dispatchEvent = (event, now) => {
   const type = normType(readString(event.type));
   if (!type)
     return;
@@ -949,6 +1160,7 @@ var startStream = async (tried = new Set) => {
     retryDelay = RETRY_BASE_MS;
     lastEventAt = Date.now();
     eventsSeen = 0;
+    resetInFlight();
     try {
       const decoder = new TextDecoder;
       const reader = response.body.getReader();
@@ -1078,15 +1290,16 @@ var isHttpOrigin = (value) => {
   }
 };
 var applyWatch = (next) => {
-  const changed = watch === null || watch.origin !== next.origin || watch.sessionId !== next.sessionId;
-  if (!changed)
-    return false;
-  if (watch === null || watch.origin !== next.origin)
+  const originChanged = watch === null || watch.origin !== next.origin;
+  if (originChanged)
     serverOrigin = null;
-  stashSession(watch?.sessionId ?? null);
   watch = next;
-  resetMeasurement();
-  loadSession(next.sessionId);
+  if (next.sessionId) {
+    watched.add(next.sessionId);
+    trackSession(next.sessionId);
+  }
+  if (!originChanged)
+    return false;
   retryDelay = RETRY_BASE_MS;
   stopStream();
   beginStream();
@@ -1140,7 +1353,8 @@ var server = http.createServer((req, res) => {
         return;
       }
       const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : null;
-      const changed = applyWatch({ origin, sessionId });
+      const fresh = sessionId !== null && !watched.has(sessionId);
+      const changed = applyWatch({ origin, sessionId }) || fresh;
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error) => {
       json(res, 400, { error: error instanceof Error ? error.message : "Invalid request" });
@@ -1149,32 +1363,43 @@ var server = http.createServer((req, res) => {
   }
   if (url.pathname === "/rate") {
     const now = Date.now();
-    const live = computeLive(now);
-    json(res, 200, {
-      connection,
-      error: lastError,
-      errorKind: lastErrorKind,
-      sessionId: watch?.sessionId ?? null,
-      busy,
-      waiting: waitingKind(),
-      toolActive: toolActive(),
-      calibrated,
-      live,
-      running: turnStartedAt !== null ? computeRunning() : null,
-      curve: computeCurve(now),
-      turn: {
-        active: turnStartedAt !== null,
-        ttftMs: liveTtftMs()
-      },
-      lastTurn,
-      eventsSeen
-    });
+    const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
+    if (requested !== null)
+      enterSession(requested);
+    let body;
+    try {
+      body = {
+        connection,
+        error: lastError,
+        errorKind: lastErrorKind,
+        sessionId: requested !== null && watched.has(requested) ? requested : null,
+        busy,
+        waiting: waitingKind(),
+        toolActive: toolActive(),
+        calibrated,
+        live: computeLive(now),
+        running: turnStartedAt !== null ? computeRunning() : null,
+        curve: computeCurve(now),
+        turn: {
+          active: turnStartedAt !== null,
+          ttftMs: liveTtftMs()
+        },
+        lastTurn,
+        eventsSeen
+      };
+    } finally {
+      if (requested !== null)
+        leaveSession();
+    }
+    json(res, 200, body);
     return;
   }
   json(res, 404, { error: "not-found" });
 });
+readPersisted();
 server.listen(port, "127.0.0.1");
 var shutdown = () => {
+  flushPersist();
   stopStream();
   server.close(() => process.exit(0));
 };

@@ -4,12 +4,20 @@
 //
 // Run: node scripts/smoke.mjs  (from the package root, after `bun run build`)
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
 const SERVICE_TOKEN = 'smoke-test-token';
 const SESSION = 'ses_smoke';
 const OTHER = 'ses_other';
+// The service writes last turn and curve beside itself so a restarted process
+// still shows numbers. Point it at a scratch file so runs cannot leak into each
+// other, and so nothing lands in the repo.
+const STATE_FILE = path.join(os.tmpdir(), `live-tps-smoke-state-${process.pid}.json`);
+fs.rmSync(STATE_FILE, { force: true });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -57,6 +65,7 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     ...process.env,
     OPENCHAMBER_SERVICE_PORT: String(svcPort),
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -413,6 +422,37 @@ rate = await (await svcFetch('/rate')).json();
 check('switching back restores last turn', rate.lastTurn?.tokensPerSecond === firstTurnTps, JSON.stringify(rate.lastTurn));
 check('switching back restores curve', Array.isArray(rate.curve) && rate.curve.length > 0, JSON.stringify(rate.curve));
 
+// --- two surfaces at once: neither disturbs the other ------------------------
+// The status page and a second surface (another window, or a second panel) can
+// ask about different sessions at the same time. Registering one used to reset
+// the other's in-progress turn and drop the shared event stream, so both pages
+// flipped between data and an empty section roughly once a second.
+ev('session.execution.started', { sessionID: SESSION });
+ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msgBoth' });
+// A gap before the first character, or the span the estimate divides by is
+// still under a millisecond and the number is refused by design.
+await sleep(150);
+ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgBoth', ordinal: 0, delta: 'b'.repeat(120) });
+await sleep(150);
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: OTHER }) });
+await sleep(150);
+const mineMidTurn = await (await svcFetch(`/rate?sessionId=${SESSION}`)).json();
+check(
+  'a second watch leaves this session mid-turn intact',
+  mineMidTurn.running !== null && mineMidTurn.turn.active === true,
+  JSON.stringify({ running: mineMidTurn.running, active: mineMidTurn.turn.active }),
+);
+check('each page reads its own session id', mineMidTurn.sessionId === SESSION, `sessionId=${mineMidTurn.sessionId}`);
+const theirsMidTurn = await (await svcFetch(`/rate?sessionId=${OTHER}`)).json();
+check('the other page reads its own session', theirsMidTurn.sessionId === OTHER, `sessionId=${theirsMidTurn.sessionId}`);
+const bareRate = await (await svcFetch('/rate')).json();
+check('bare /rate still answers for the last watch', bareRate.sessionId === OTHER, `sessionId=${bareRate.sessionId}`);
+ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msgBoth', tokens: { output: 40, reasoning: 0 } });
+ev('session.execution.succeeded', { sessionID: SESSION });
+await sleep(150);
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await sleep(200);
+
 // --- turn 14: missed execution.started must not stick the turn on idle -----
 // Regression for the "tools running but status shows idle/empty" report:
 // the service attached after the turn began, so no `execution.started` was
@@ -564,7 +604,64 @@ const afterDiscovery = await (await svcFetch('/rate')).json();
 check('events flow after discovery', afterDiscovery.busy === true, JSON.stringify({ busy: afterDiscovery.busy }));
 ev('session.execution.succeeded', { sessionID: SESSION });
 
+// --- persistence: a restarted service still answers --------------------------
+// Closing OpenChamber kills this process. The numbers already measured are on
+// disk, so the panel shows the last turn straight away instead of sitting
+// empty until the next conversation finishes.
+await sleep(1800); // let the debounced write land
+const beforeRestart = (await (await svcFetch(`/rate?sessionId=${SESSION}`)).json()).lastTurn;
+check('last turn present before restart', Boolean(beforeRestart), JSON.stringify(beforeRestart));
+svc.kill();
+await once(svc, 'exit');
+await sleep(300);
+
+const svc2 = spawn(process.execPath, ['service/main.js'], {
+  env: {
+    ...process.env,
+    OPENCHAMBER_SERVICE_PORT: String(svcPort),
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+svc2.stderr.on('data', (d) => process.stderr.write(`[service2] ${d}`));
+const svc2Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
+  ...init,
+  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+});
+let ready2 = false;
+for (let i = 0; i < 50 && !ready2; i += 1) {
+  try {
+    ready2 = (await svc2Fetch('/health')).ok;
+  } catch { /* not up yet */ }
+  if (!ready2) await sleep(100);
+}
+check('service comes back after restart', ready2);
+
+const cold = ready2 ? await (await svc2Fetch(`/rate?sessionId=${SESSION}`)).json() : null;
+check(
+  'restart: reported unwatched until a page asks again',
+  cold !== null && cold.sessionId === null,
+  `sessionId=${cold?.sessionId}`,
+);
+check(
+  'restart: last turn restored from disk',
+  cold?.lastTurn?.tokensPerSecond === beforeRestart?.tokensPerSecond && cold?.lastTurn != null,
+  JSON.stringify(cold?.lastTurn),
+);
+check(
+  'restart: curve restored from disk',
+  Array.isArray(cold?.curve) && cold.curve.length > 0,
+  JSON.stringify(cold?.curve),
+);
+await svc2Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await sleep(300);
+const warm = await (await svc2Fetch(`/rate?sessionId=${SESSION}`)).json();
+check('restart: watching again marks it live', warm.sessionId === SESSION, `sessionId=${warm.sessionId}`);
+svc2.kill();
+
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
 svc.kill();
 sseServer.close();
+fs.rmSync(STATE_FILE, { force: true });
 process.exit(failures === 0 ? 0 : 1);

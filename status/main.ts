@@ -248,7 +248,12 @@ const poll = async (): Promise<void> => {
   }
   polling = true;
   try {
-    const result = await host.serviceRequest({ method: 'GET', path: '/rate' });
+    // Name the session so a page and a service holding different sessions
+    // each read their own record instead of whichever one watched last.
+    const result = await host.serviceRequest({
+      method: 'GET',
+      path: session?.id ? `/rate?sessionId=${encodeURIComponent(session.id)}` : '/rate',
+    });
     if (result.status < 400) {
       const rate = JSON.parse(result.body) as RateResponse;
       render(rate);
