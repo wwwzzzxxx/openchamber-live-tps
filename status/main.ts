@@ -47,8 +47,6 @@ type HostSession = { id: string; title: string; busy: boolean } | null;
 const COPY = {
   zh: {
     unit: 'tok/s',
-    idle: '空闲',
-    generating: '生成中',
     toolRunning: '工具执行中',
     waitingPermission: '等授权',
     waitingQuestion: '等回答',
@@ -67,8 +65,6 @@ const COPY = {
   },
   en: {
     unit: 'tok/s',
-    idle: 'idle',
-    generating: 'generating',
     toolRunning: 'running tool',
     waitingPermission: 'waiting for permission',
     waitingQuestion: 'waiting for answer',
@@ -160,11 +156,17 @@ const fitHeight = (): void => {
   }
 };
 
+const setState = (text: string): void => {
+  // An empty state must not leave a flex gap behind in the meta row.
+  stateEl.textContent = text;
+  stateEl.hidden = text.length === 0;
+};
+
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
     valueEl.textContent = '—';
-    stateEl.textContent = notice ?? copy.connecting;
+    setState(notice ?? copy.connecting);
     lastEl.textContent = '';
     drawSpark(sparkParts, [], SPARK_W, SPARK_H);
     fitHeight();
@@ -174,27 +176,26 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     dot.className = 'dot wait';
     // A network failure is a wrong address, not a bad response: name the
     // condition rather than leak the runtime's `fetch failed`.
-    stateEl.textContent = rate.errorKind === 'network'
-      ? copy.unreachable
-      : (rate.error ?? copy.reconnecting);
+    setState(
+      rate.errorKind === 'network' ? copy.unreachable : (rate.error ?? copy.reconnecting),
+    );
   } else if (rate.connection !== 'live') {
     dot.className = 'dot';
-    stateEl.textContent = copy.connecting;
+    setState(copy.connecting);
   } else if (rate.waiting === 'permission') {
     dot.className = 'dot wait';
-    stateEl.textContent = copy.waitingPermission;
+    setState(copy.waitingPermission);
   } else if (rate.waiting === 'question') {
     dot.className = 'dot wait';
-    stateEl.textContent = copy.waitingQuestion;
+    setState(copy.waitingQuestion);
   } else if (rate.toolActive) {
     dot.className = 'dot live';
-    stateEl.textContent = copy.toolRunning;
-  } else if (rate.busy) {
-    dot.className = 'dot live';
-    stateEl.textContent = copy.generating;
+    setState(copy.toolRunning);
   } else {
-    dot.className = 'dot';
-    stateEl.textContent = copy.idle;
+    // "generating" and "idle" say nothing the dot and the headline do not
+    // already say — they only stretched the meta line.
+    dot.className = rate.busy ? 'dot live' : 'dot';
+    setState('');
   }
 
   const live = rate.live.tps;
@@ -226,7 +227,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   }
   lastEl.textContent = parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData);
 
-  if (notice) stateEl.textContent = notice;
+  if (notice) setState(notice);
   fitHeight();
 };
 

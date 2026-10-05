@@ -36,7 +36,7 @@
       },
       "statusSection": {
         "entry": "status/index.html",
-        "title": "实时",
+        "title": "Live TPS",
         "height": 64
       },
       "service": {

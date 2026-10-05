@@ -66,7 +66,7 @@ const COPY = {
     connecting: 'connecting', reconnecting: 'reconnecting',
     noService: 'Allow the local service in Settings → Extensions',
     noOrigin: 'Cannot reach the OpenChamber server from this surface',
-    live: 'live', lastTurn: 'last turn', ttft: 'TTFT',
+    live: 'live', lastTurn: 'last', ttft: 'TTFT',
     reasoning: 'reasoning share', connection: 'connection', events: 'events',
     measured: 'measured', estimated: 'estimated',
     noReasoning: 'No reasoning reported for this turn',
