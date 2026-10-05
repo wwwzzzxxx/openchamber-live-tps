@@ -478,18 +478,27 @@ const memoryOf = (state: SessionState): SessionMemory => ({
   calibrated: state.calibrated,
 });
 
+/** Read a state file's raw session entries; anything unreadable is just empty. */
+const readSessions = (file: string): Record<string, unknown> => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { version?: unknown; sessions?: unknown };
+    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions) return {};
+    const out: Record<string, unknown> = {};
+    for (const [id, raw] of Object.entries(parsed.sessions as Record<string, unknown>)) {
+      if (id && raw && typeof raw === 'object') out[id] = raw;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
+
 /** Restore durable numbers so a restarted service answers immediately. */
 const readPersisted = (): void => {
   for (const file of statePaths()) {
-    let parsed: { version?: unknown; sessions?: unknown } | null = null;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { version?: unknown; sessions?: unknown };
-    } catch {
-      continue;
-    }
-    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions) continue;
-    for (const [id, raw] of Object.entries(parsed.sessions as Record<string, unknown>)) {
-      if (!id || !raw || typeof raw !== 'object') continue;
+    const sessions = readSessions(file);
+    if (Object.keys(sessions).length === 0) continue;
+    for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw as Partial<SessionMemory>;
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
@@ -508,11 +517,19 @@ let persistTimer: NodeJS.Timeout | null = null;
 let persistDirty = false;
 
 const writePersisted = (): void => {
-  const sessions: Record<string, SessionMemory> = {};
-  for (const [id, state] of sessionStates) sessions[id] = memoryOf(state);
-  const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+  const own: Record<string, unknown> = {};
+  for (const [id, state] of sessionStates) own[id] = memoryOf(state);
   for (const file of statePaths()) {
     try {
+      // Two OpenChamber servers can share one workspace, so two services share
+      // this directory. Overlay our sessions on whatever is already there
+      // instead of clobbering the other instance's history.
+      const foreign = Object.entries(readSessions(file)).filter(([id]) => own[id] === undefined);
+      const sessions: Record<string, unknown> = { ...own };
+      for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
+        sessions[id] = memory;
+      }
+      const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, payload, 'utf8');
       fs.renameSync(tmp, file);

@@ -243,19 +243,27 @@ var memoryOf = (state) => ({
   charsPerToken: state.charsPerToken,
   calibrated: state.calibrated
 });
+var readSessions = (file) => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
+      return {};
+    const out = {};
+    for (const [id, raw] of Object.entries(parsed.sessions)) {
+      if (id && raw && typeof raw === "object")
+        out[id] = raw;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
 var readPersisted = () => {
   for (const file of statePaths()) {
-    let parsed = null;
-    try {
-      parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    } catch {
+    const sessions = readSessions(file);
+    if (Object.keys(sessions).length === 0)
       continue;
-    }
-    if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
-      continue;
-    for (const [id, raw] of Object.entries(parsed.sessions)) {
-      if (!id || !raw || typeof raw !== "object")
-        continue;
+    for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw;
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
@@ -270,12 +278,17 @@ var readPersisted = () => {
 var persistTimer = null;
 var persistDirty = false;
 var writePersisted = () => {
-  const sessions = {};
+  const own = {};
   for (const [id, state] of sessionStates)
-    sessions[id] = memoryOf(state);
-  const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+    own[id] = memoryOf(state);
   for (const file of statePaths()) {
     try {
+      const foreign = Object.entries(readSessions(file)).filter(([id]) => own[id] === undefined);
+      const sessions = { ...own };
+      for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
+        sessions[id] = memory;
+      }
+      const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, payload, "utf8");
       fs.renameSync(tmp, file);
