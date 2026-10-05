@@ -54,6 +54,36 @@ const DISCOVERY_INTERVAL_MS = 5_000;
 // opencode-tps-meter (see shared/tokens.ts): ceil(chars / 4). It is an
 // approximation and is meant to be — provider-reported counts replace it
 // whenever they arrive.
+//
+// Until they do, the correction below is what keeps the live number honest:
+// the `calibrated live rate` from opencode-tps-meter v2, learned per model.
+// A model whose real ratio departs from chars/4 is corrected by a factor here
+// rather than by picking a different divisor, so the estimate converges on the
+// provider's own count after a step or two.
+const CALIBRATION_WEIGHT = 0.3;
+const MIN_CALIBRATION_FACTOR = 0.25;
+const MAX_CALIBRATION_FACTOR = 4;
+/** Learned correction per model id; `*` covers a stream that never names one. */
+let calibration = new Map<string, number>();
+/** Model behind the turn currently streaming, used when a step names none. */
+let currentModel = '*';
+
+const calibrationFactor = (): number => calibration.get(currentModel) ?? 1;
+
+/** Tokens for a streamed character total, corrected toward the model's real ratio. */
+const estimateTokens = (chars: number): number =>
+  Math.round(tokensFromChars(chars) * calibrationFactor());
+
+const calibrate = (model: string, chars: number, generated: number): void => {
+  if (!Number.isFinite(chars) || chars <= 0) return;
+  if (!Number.isFinite(generated) || generated <= 0) return;
+  const heuristic = tokensFromChars(chars);
+  if (heuristic <= 0) return;
+  const ratio = generated / heuristic;
+  const factor = Math.min(MAX_CALIBRATION_FACTOR, Math.max(MIN_CALIBRATION_FACTOR, ratio));
+  const previous = calibration.get(model) ?? 1;
+  calibration.set(model, previous + (factor - previous) * CALIBRATION_WEIGHT);
+};
 /**
  * A gap between streamed characters longer than this is a pause, not
  * generation: tool execution, a retry, or the agent waiting for the user. That
@@ -469,11 +499,31 @@ const readSessions = (file: string): Record<string, unknown> => {
   }
 };
 
+/** Learned per-model corrections stored beside the sessions. */
+const readModels = (file: string): Record<string, number> => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { models?: unknown };
+    const out: Record<string, number> = {};
+    const models = parsed && typeof parsed.models === 'object' ? parsed.models : null;
+    if (models) {
+      for (const [key, value] of Object.entries(models as Record<string, unknown>)) {
+        if (key && typeof value === 'number' && Number.isFinite(value)) out[key] = value;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
+
 /** Restore durable numbers so a restarted service answers immediately. */
 const readPersisted = (): void => {
   for (const file of statePaths()) {
     const sessions = readSessions(file);
     if (Object.keys(sessions).length === 0) continue;
+    for (const [model, factor] of Object.entries(readModels(file))) {
+      calibration.set(model, factor as number);
+    }
     for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw as Partial<SessionMemory>;
       const state = createSessionState(id);
@@ -501,7 +551,12 @@ const writePersisted = (): void => {
       for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
         sessions[id] = memory;
       }
-      const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+      const payload = JSON.stringify({
+        version: PERSIST_VERSION,
+        savedAt: Date.now(),
+        sessions,
+        models: { ...readModels(file), ...Object.fromEntries(calibration) },
+      });
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, payload, 'utf8');
       fs.renameSync(tmp, file);
@@ -713,7 +768,7 @@ const contributeStep = (step: StepRecord): StepContribution | null => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = tokensFromChars(step.chars);
+    tokens = estimateTokens(step.chars);
     real = false;
   } else {
     return null;
@@ -786,7 +841,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   // and tool runs, so they are the honest denominator when the reconstruction
   // will not hold.
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(tokensFromChars(turnChars), elapsedMs);
+  const tps = plausibleRate(estimateTokens(turnChars), elapsedMs);
   if (tps === null) {
     // Nothing defensible to freeze: leave the cache empty rather than a number
     // that only looks like a measurement.
@@ -830,7 +885,7 @@ const finalizeTurn = (now: number): void => {
     1,
     turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS),
   );
-  const tps = plausibleRate(tokensFromChars(turnChars), activeMs);
+  const tps = plausibleRate(estimateTokens(turnChars), activeMs);
   if (tps === null) {
     // The window cannot carry a number: keep the previous turn's average
     // rather than publishing one built on a clamped span.
@@ -840,7 +895,7 @@ const finalizeTurn = (now: number): void => {
   lastTurn = {
     tokensPerSecond: tps,
     source: 'estimate',
-    tokens: tokensFromChars(turnChars),
+    tokens: estimateTokens(turnChars),
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -961,6 +1016,7 @@ const toolPartID = (messageID: string, callID: string): string => `${messageID}:
 const settleStep = (messageID: string, output: number, reasoning: number, now: number): void => {
   const generated = output + reasoning;
   if (!messageID || generated <= 0) return;
+  calibrate(currentModel, messageChars.get(messageID) ?? 0, generated);
   const step = stepFor(messageID, now);
   step.output = output;
   step.reasoning = reasoning;
@@ -1170,6 +1226,10 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     markActive(now);
     const messageID = readString(payload.assistantMessageID);
     if (!messageID) return;
+    // v2 names the model on the step; remember it so the correction is learned
+    // per model rather than per session.
+    const model = readString(payload.modelID) || readString(payload.model);
+    if (model) currentModel = model;
     const existing = steps.get(messageID);
     if (existing && (existing.settled || existing.endAt !== null)) {
       // A retried step reuses its message id: time the new attempt fresh.
@@ -1630,7 +1690,7 @@ const computeLive = (now: number): {
     // Not the headline, but a published field: a window whose samples all
     // landed in the same millisecond would otherwise report the same broken
     // rate the estimate path used to.
-    tps: Math.min(tokensFromChars(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1663,7 +1723,7 @@ const liveBuckets = (now: number): number[] => {
     // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
     // normalizes by the largest point, so a single such bucket flattened every
     // other point on the curve.
-    out.push(Math.min(tokensFromChars(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   // Trim leading silence so a fresh turn starts drawing immediately.
   let lead = 0;

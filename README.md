@@ -74,6 +74,13 @@ prove wrong for some model.
 estimate when they arrive, and the value is then labelled `measured`. The
 heuristic is only the fallback, labelled `estimated`.
 
+The live number also takes the **calibrated live rate** from that project's v2:
+each finished step compares the provider's reported token count against the
+heuristic and nudges a per-model correction factor toward the truth (exponential
+average, clamped to 0.25–4×). A model that departs from `chars/4` converges on
+its own ratio within a step or two, and the factor is persisted alongside the
+turn history, so a restart starts from what the service already learned.
+
 It matters what those characters are. The stream carries `text` parts, `reasoning`
 parts, and tool-call JSON:
 
@@ -126,10 +133,10 @@ OpenChamber reports real numbers instead of `unreachable`.
 - A step that produced no measurable output contributes no time and no tokens —
   the average only covers spans where something was actually produced. A
   `reasoning` delta is only a share of output while the step has produced no text.
-- The live number is the `chars/4` heuristic, so it can sit away from the final
-  `measured` average — roughly a quarter off, by the source project's own
-  measurement. A provider that never reports token counts stays on the estimate,
-  labelled `estimated`.
+- The live number is the `chars/4` heuristic corrected by a learned per-model
+  factor, so the first step or two of a model it has not seen before can sit away
+  from the final `measured` average. A provider that never reports token counts
+  stays on the raw heuristic, labelled `estimated`.
 
 ## License
 

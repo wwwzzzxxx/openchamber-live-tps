@@ -29,6 +29,26 @@ var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
 var PROBE_TIMEOUT_MS = 2000;
 var DISCOVERY_INTERVAL_MS = 5000;
+var CALIBRATION_WEIGHT = 0.3;
+var MIN_CALIBRATION_FACTOR = 0.25;
+var MAX_CALIBRATION_FACTOR = 4;
+var calibration = new Map;
+var currentModel = "*";
+var calibrationFactor = () => calibration.get(currentModel) ?? 1;
+var estimateTokens = (chars) => Math.round(tokensFromChars(chars) * calibrationFactor());
+var calibrate = (model, chars, generated) => {
+  if (!Number.isFinite(chars) || chars <= 0)
+    return;
+  if (!Number.isFinite(generated) || generated <= 0)
+    return;
+  const heuristic = tokensFromChars(chars);
+  if (heuristic <= 0)
+    return;
+  const ratio = generated / heuristic;
+  const factor = Math.min(MAX_CALIBRATION_FACTOR, Math.max(MIN_CALIBRATION_FACTOR, ratio));
+  const previous = calibration.get(model) ?? 1;
+  calibration.set(model, previous + (factor - previous) * CALIBRATION_WEIGHT);
+};
 var MAX_STREAM_GAP_MS = 1000;
 var TURNS_CAP = 30;
 var SESSIONS_CAP = 20;
@@ -249,11 +269,30 @@ var readSessions = (file) => {
     return {};
   }
 };
+var readModels = (file) => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const out = {};
+    const models = parsed && typeof parsed.models === "object" ? parsed.models : null;
+    if (models) {
+      for (const [key, value] of Object.entries(models)) {
+        if (key && typeof value === "number" && Number.isFinite(value))
+          out[key] = value;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+};
 var readPersisted = () => {
   for (const file of statePaths()) {
     const sessions = readSessions(file);
     if (Object.keys(sessions).length === 0)
       continue;
+    for (const [model, factor] of Object.entries(readModels(file))) {
+      calibration.set(model, factor);
+    }
     for (const [id, raw] of Object.entries(sessions)) {
       const memory = raw;
       const state = createSessionState(id);
@@ -277,7 +316,12 @@ var writePersisted = () => {
       for (const [id, memory] of foreign.slice(0, Math.max(0, SESSIONS_CAP - Object.keys(own).length))) {
         sessions[id] = memory;
       }
-      const payload = JSON.stringify({ version: PERSIST_VERSION, savedAt: Date.now(), sessions });
+      const payload = JSON.stringify({
+        version: PERSIST_VERSION,
+        savedAt: Date.now(),
+        sessions,
+        models: { ...readModels(file), ...Object.fromEntries(calibration) }
+      });
       const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, payload, "utf8");
       fs.renameSync(tmp, file);
@@ -432,7 +476,7 @@ var contributeStep = (step) => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = tokensFromChars(step.chars);
+    tokens = estimateTokens(step.chars);
     real = false;
   } else {
     return null;
@@ -487,7 +531,7 @@ var computeRunning = () => {
   const frozenTool = turnToolMs + (toolStartAt !== null ? Math.max(0, ref - toolStartAt) : 0);
   const reconstructed = turnExecAt === null ? ref - turnStartedAt : ref - turnExecAt - frozenWait - frozenTool;
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(tokensFromChars(turnChars), elapsedMs);
+  const tps = plausibleRate(estimateTokens(turnChars), elapsedMs);
   if (tps === null) {
     fbTps = NaN;
     return null;
@@ -524,7 +568,7 @@ var finalizeTurn = (now) => {
     return;
   }
   const activeMs = Math.max(1, turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS));
-  const tps = plausibleRate(tokensFromChars(turnChars), activeMs);
+  const tps = plausibleRate(estimateTokens(turnChars), activeMs);
   if (tps === null) {
     clearTurn();
     return;
@@ -532,7 +576,7 @@ var finalizeTurn = (now) => {
   lastTurn = {
     tokensPerSecond: tps,
     source: "estimate",
-    tokens: tokensFromChars(turnChars),
+    tokens: estimateTokens(turnChars),
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -614,6 +658,7 @@ var settleStep = (messageID, output, reasoning, now) => {
   const generated = output + reasoning;
   if (!messageID || generated <= 0)
     return;
+  calibrate(currentModel, messageChars.get(messageID) ?? 0, generated);
   const step = stepFor(messageID, now);
   step.output = output;
   step.reasoning = reasoning;
@@ -812,6 +857,9 @@ var dispatchEvent = (event, now) => {
     const messageID = readString(payload.assistantMessageID);
     if (!messageID)
       return;
+    const model = readString(payload.modelID) || readString(payload.model);
+    if (model)
+      currentModel = model;
     const existing = steps.get(messageID);
     if (existing && (existing.settled || existing.endAt !== null)) {
       steps.delete(messageID);
@@ -1226,7 +1274,7 @@ var computeLive = (now) => {
       textChars += sample.chars;
   }
   return {
-    tps: Math.min(tokensFromChars(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1254,7 +1302,7 @@ var liveBuckets = (now) => {
       out.push(0);
       continue;
     }
-    out.push(Math.min(tokensFromChars(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   let lead = 0;
   while (lead < out.length && out[lead] <= 0)
