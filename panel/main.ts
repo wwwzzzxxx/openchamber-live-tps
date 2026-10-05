@@ -32,7 +32,6 @@ type RateResponse = {
   busy: boolean;
   waiting: 'permission' | 'question' | null;
   toolActive: boolean;
-  calibrated: boolean;
   live: Live;
   running: { tps: number; source: 'tokens' | 'estimate' } | null;
   curve: number[];
@@ -56,7 +55,7 @@ const COPY = {
     noReasoning: '本轮无推理数据（模型未上报推理）',
     noData: '打开一个对话并让模型生成后显示',
     inProgress: '本轮进行中…',
-    estimateNote: '实时值为字符流按已校准比例折算；上轮均值优先用提供商上报的真实 token。',
+    estimateNote: '实时值按字符数启发式换算（字符/4）；上轮均值优先用提供商上报的真实 token。',
   },
   en: {
     title: 'Live TPS',
@@ -72,7 +71,7 @@ const COPY = {
     noReasoning: 'No reasoning reported for this turn',
     noData: 'Open a chat and let the model generate',
     inProgress: 'Turn in progress…',
-    estimateNote: 'Live values convert streamed characters with a calibrated ratio; last-turn averages prefer provider-reported tokens.',
+    estimateNote: 'Live values estimate tokens from characters (chars/4); last-turn averages prefer provider-reported tokens.',
   },
 } as const;
 

@@ -31,7 +31,6 @@ type RateResponse = {
   busy: boolean;
   waiting: 'permission' | 'question' | null;
   toolActive: boolean;
-  calibrated: boolean;
   live: Live;
   /** Running turn average; null when nothing has streamed yet this turn. */
   running: { tps: number; source: 'tokens' | 'estimate' } | null;

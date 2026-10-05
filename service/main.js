@@ -5,6 +5,17 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+
+// shared/tokens.ts
+var CHARS_DIV_4 = 4;
+var CHARS_DIV_3 = 3;
+var tokensFromChars = (chars, algorithm = "heuristic") => {
+  if (!Number.isFinite(chars) || chars <= 0)
+    return 0;
+  return Math.ceil(chars / (algorithm === "code" ? CHARS_DIV_3 : CHARS_DIV_4));
+};
+
+// service/main.ts
 var execFileAsync = promisify(execFile);
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
@@ -18,11 +29,6 @@ var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
 var PROBE_TIMEOUT_MS = 2000;
 var DISCOVERY_INTERVAL_MS = 5000;
-var DEFAULT_TOKENS_PER_CHAR = 0.25;
-var MIN_TOKENS_PER_CHAR = 0.05;
-var MAX_TOKENS_PER_CHAR = 1;
-var CALIBRATION_WEIGHT = 0.3;
-var MIN_CALIBRATION_CHARS = 40;
 var MAX_STREAM_GAP_MS = 1000;
 var TURNS_CAP = 30;
 var SESSIONS_CAP = 20;
@@ -43,8 +49,6 @@ var lastDiscoveryAt = 0;
 var lastEventAt = 0;
 var eventsSeen = 0;
 var busy = false;
-var tokensPerChar = DEFAULT_TOKENS_PER_CHAR;
-var calibrated = false;
 var controller = null;
 var retryTimer = null;
 var retryDelay = RETRY_BASE_MS;
@@ -63,7 +67,6 @@ var steps = new Map;
 var turnStepOrder = [];
 var pendingToolStep = new Map;
 var fbChars = -1;
-var fbRatio = NaN;
 var fbTps = NaN;
 var lastTurn = null;
 var pendingPermissions = new Set;
@@ -81,7 +84,6 @@ var clearTurn = () => {
   turnToolMs = 0;
   toolStartAt = null;
   fbChars = -1;
-  fbRatio = NaN;
   fbTps = NaN;
   for (const id of turnStepOrder)
     steps.delete(id);
@@ -100,8 +102,6 @@ var createSessionState = (sessionId) => ({
   deltaToolCalls: new Set,
   messageChars: new Map,
   busy: false,
-  tokensPerChar: DEFAULT_TOKENS_PER_CHAR,
-  calibrated: false,
   turnExecAt: null,
   turnStartedAt: null,
   turnLastCharAt: null,
@@ -117,7 +117,6 @@ var createSessionState = (sessionId) => ({
   turnStepOrder: [],
   pendingToolStep: new Map,
   fbChars: -1,
-  fbRatio: NaN,
   fbTps: NaN,
   lastTurn: null,
   turns: [],
@@ -168,8 +167,6 @@ var enterSession = (sessionId) => {
   deltaToolCalls = state.deltaToolCalls;
   messageChars = state.messageChars;
   busy = state.busy;
-  tokensPerChar = state.tokensPerChar;
-  calibrated = state.calibrated;
   turnExecAt = state.turnExecAt;
   turnStartedAt = state.turnStartedAt;
   turnLastCharAt = state.turnLastCharAt;
@@ -185,7 +182,6 @@ var enterSession = (sessionId) => {
   turnStepOrder = state.turnStepOrder;
   pendingToolStep = state.pendingToolStep;
   fbChars = state.fbChars;
-  fbRatio = state.fbRatio;
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
   turns = state.turns;
@@ -203,8 +199,6 @@ var leaveSession = () => {
   state.deltaToolCalls = deltaToolCalls;
   state.messageChars = messageChars;
   state.busy = busy;
-  state.tokensPerChar = tokensPerChar;
-  state.calibrated = calibrated;
   state.turnExecAt = turnExecAt;
   state.turnStartedAt = turnStartedAt;
   state.turnLastCharAt = turnLastCharAt;
@@ -220,7 +214,6 @@ var leaveSession = () => {
   state.turnStepOrder = turnStepOrder;
   state.pendingToolStep = pendingToolStep;
   state.fbChars = fbChars;
-  state.fbRatio = fbRatio;
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
   state.turns = turns;
@@ -239,9 +232,7 @@ var statePaths = () => {
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
-  turns: state.turns.slice(-TURNS_CAP),
-  tokensPerChar: state.tokensPerChar,
-  calibrated: state.calibrated
+  turns: state.turns.slice(-TURNS_CAP)
 });
 var readSessions = (file) => {
   try {
@@ -268,10 +259,6 @@ var readPersisted = () => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
-      const legacy = raw.charsPerToken;
-      const savedRatio = memory.tokensPerChar ?? legacy;
-      state.tokensPerChar = typeof savedRatio === "number" && Number.isFinite(savedRatio) ? savedRatio : DEFAULT_TOKENS_PER_CHAR;
-      state.calibrated = memory.calibrated === true;
       sessionStates.set(id, state);
     }
     return;
@@ -445,7 +432,7 @@ var contributeStep = (step) => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = step.chars * tokensPerChar;
+    tokens = tokensFromChars(step.chars);
     real = false;
   } else {
     return null;
@@ -492,7 +479,7 @@ var computeRunning = () => {
     return { tps: sum.tokens / (sum.netMs / 1000), source: sum.real ? "tokens" : "estimate" };
   if (turnStartedAt === null || turnChars === 0)
     return null;
-  if (turnChars === fbChars && tokensPerChar === fbRatio && Number.isFinite(fbTps)) {
+  if (turnChars === fbChars && Number.isFinite(fbTps)) {
     return { tps: fbTps, source: "estimate" };
   }
   const ref = turnLastCharAt ?? turnStartedAt;
@@ -500,13 +487,12 @@ var computeRunning = () => {
   const frozenTool = turnToolMs + (toolStartAt !== null ? Math.max(0, ref - toolStartAt) : 0);
   const reconstructed = turnExecAt === null ? ref - turnStartedAt : ref - turnExecAt - frozenWait - frozenTool;
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(turnChars * tokensPerChar, elapsedMs);
+  const tps = plausibleRate(tokensFromChars(turnChars), elapsedMs);
   if (tps === null) {
     fbTps = NaN;
     return null;
   }
   fbChars = turnChars;
-  fbRatio = tokensPerChar;
   fbTps = tps;
   return { tps, source: "estimate" };
 };
@@ -538,7 +524,7 @@ var finalizeTurn = (now) => {
     return;
   }
   const activeMs = Math.max(1, turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS));
-  const tps = plausibleRate(turnChars * tokensPerChar, activeMs);
+  const tps = plausibleRate(tokensFromChars(turnChars), activeMs);
   if (tps === null) {
     clearTurn();
     return;
@@ -546,7 +532,7 @@ var finalizeTurn = (now) => {
   lastTurn = {
     tokensPerSecond: tps,
     source: "estimate",
-    tokens: turnChars * tokensPerChar,
+    tokens: tokensFromChars(turnChars),
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -624,22 +610,10 @@ var markActive = (now) => {
 };
 var readToolCallID = (payload) => readString(payload.callID) || readString(payload.id) || readString(payload.toolCallID);
 var toolPartID = (messageID, callID) => `${messageID}:tool:${callID || "input"}`;
-var calibrate = (messageID, output, reasoning) => {
-  const chars = messageChars.get(messageID) ?? 0;
-  if (chars < MIN_CALIBRATION_CHARS)
-    return;
-  const generated = output + reasoning;
-  if (!Number.isFinite(generated) || generated <= 0)
-    return;
-  const ratio = Math.min(MAX_TOKENS_PER_CHAR, Math.max(MIN_TOKENS_PER_CHAR, generated / chars));
-  tokensPerChar = tokensPerChar + (ratio - tokensPerChar) * CALIBRATION_WEIGHT;
-  calibrated = true;
-};
 var settleStep = (messageID, output, reasoning, now) => {
   const generated = output + reasoning;
   if (!messageID || generated <= 0)
     return;
-  calibrate(messageID, output, reasoning);
   const step = stepFor(messageID, now);
   step.output = output;
   step.reasoning = reasoning;
@@ -1252,7 +1226,7 @@ var computeLive = (now) => {
       textChars += sample.chars;
   }
   return {
-    tps: Math.min(chars / (spanMs / 1000) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min(tokensFromChars(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1280,7 +1254,7 @@ var liveBuckets = (now) => {
       out.push(0);
       continue;
     }
-    out.push(Math.min(chars / (width / 1000) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min(tokensFromChars(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   let lead = 0;
   while (lead < out.length && out[lead] <= 0)
@@ -1391,7 +1365,6 @@ var server = http.createServer((req, res) => {
         busy,
         waiting: waitingKind(),
         toolActive: toolActive(),
-        calibrated,
         live: computeLive(now),
         running: turnStartedAt !== null ? computeRunning() : null,
         curve: computeCurve(now),

@@ -7,8 +7,8 @@ session, plus the last turn's average and time to first token.
 
 ![The Work Status panel with the Live TPS section showing 25.1 tok/s above Turn stats](docs/work-status.png)
 
-`tok/s` here is estimated from streamed characters and calibrated against
-provider-reported token counts — there is no tokenizer. See [Counting](#counting).
+`tok/s` here is estimated from streamed characters with a heuristic — there is
+no tokenizer. See [Counting](#counting).
 
 ## What it shows
 
@@ -63,19 +63,16 @@ anyway, because the live number has to exist before the tokens do. The honest
 source would be the `usage` block each provider returns, but that arrives with
 the message end, too late to be live.
 
-So the stream is **characters**, converted to tokens with a ratio:
+So the estimate is the heuristic from
+[`opencode-tps-meter`](https://github.com/ChiR24/opencode-tps-meter), ported
+verbatim into `shared/tokens.ts`: **`Math.ceil(characters / 4)`**, the figure
+for general text (that project measures it at ~75% accurate). It also ships
+`chars/3` for code and `words/0.75` for English prose, should the default ever
+prove wrong for some model.
 
-- **The ratio starts at `0.25` tokens per character (4 characters per token)**,
-  the usual figure for English prose.
-- **Every finished step recalibrates it.** When the provider reports real token
-  counts, the ratio moves toward `generated tokens / streamed characters` — an
-  exponential average (weight `0.3`), clamped to `0.05`–`1` so a single odd step
-  cannot skew the meter. It is learned per session and persisted to disk, so the
-  live number converges on the model's actual ratio instead of staying on a
-  fixed guess.
-- **`last` prefers the real thing.** Provider-reported token counts replace the
-  estimate when they arrive, and the value is then labelled `measured`. The
-  character estimate is only the fallback, labelled `estimated`.
+`last` prefers the real thing: provider-reported token counts replace the
+estimate when they arrive, and the value is then labelled `measured`. The
+heuristic is only the fallback, labelled `estimated`.
 
 It matters what those characters are. The stream carries `text` parts, `reasoning`
 parts, and tool-call JSON:
@@ -129,11 +126,10 @@ OpenChamber reports real numbers instead of `unreachable`.
 - A step that produced no measurable output contributes no time and no tokens —
   the average only covers spans where something was actually produced. A
   `reasoning` delta is only a share of output while the step has produced no text.
-- The live number converts characters with a learned ratio, so a brand-new
-  session starts from the `0.25` assumption and can drift from the final
-  `measured` average until its first real token counts arrive and recalibrate it.
-  A provider that never reports token counts stays on the estimate, labelled
-  `estimated`.
+- The live number is the `chars/4` heuristic, so it can sit away from the final
+  `measured` average — roughly a quarter off, by the source project's own
+  measurement. A provider that never reports token counts stays on the estimate,
+  labelled `estimated`.
 
 ## License
 

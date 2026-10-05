@@ -24,6 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { tokensFromChars } from '../shared/tokens';
 
 const execFileAsync = promisify(execFile);
 
@@ -49,16 +50,10 @@ const PROBE_TIMEOUT_MS = 2_000;
 /** Origin discovery is a handful of dials against the parent process; keep it off the hot retry path. */
 const DISCOVERY_INTERVAL_MS = 5_000;
 
-// Tokens per streamed character. No tokenizer runs here — the stream is
-// characters, converted with this ratio. Ratios vary by model, language and
-// content, so completed steps recalibrate it from real token counts. The clamp
-// keeps a single odd step from skewing the meter.
-const DEFAULT_TOKENS_PER_CHAR = 0.25;
-const MIN_TOKENS_PER_CHAR = 0.05;
-const MAX_TOKENS_PER_CHAR = 1;
-const CALIBRATION_WEIGHT = 0.3;
-/** Ignore tiny settled steps when calibrating; they carry no signal. */
-const MIN_CALIBRATION_CHARS = 40;
+// Characters are converted to tokens with the heuristic ported from
+// opencode-tps-meter (see shared/tokens.ts): ceil(chars / 4). It is an
+// approximation and is meant to be — provider-reported counts replace it
+// whenever they arrive.
 /**
  * A gap between streamed characters longer than this is a pause, not
  * generation: tool execution, a retry, or the agent waiting for the user. That
@@ -104,8 +99,6 @@ type TurnPoint = { tps: number; at: number };
 type SessionMemory = {
   lastTurn: TurnResult | null;
   turns: TurnPoint[];
-  tokensPerChar: number;
-  calibrated: boolean;
 };
 /** Finished-turn curve points kept per session. */
 const TURNS_CAP = 30;
@@ -128,7 +121,7 @@ let partChars = new Map<string, number>();
 let deltaParts = new Set<string>();
 /** Tool-input fragments already counted through input deltas, never diffed again. */
 let deltaToolCalls = new Set<string>();
-/** Characters seen per assistant message id, used to calibrate tokens per character. */
+/** Characters seen per assistant message id. */
 let messageChars = new Map<string, number>();
 
 let watch: WatchConfig | null = null;
@@ -153,8 +146,6 @@ let lastEventAt = 0;
 /** Every parsed event on the stream, watched session or not, for diagnosis. */
 let eventsSeen = 0;
 let busy = false;
-let tokensPerChar = DEFAULT_TOKENS_PER_CHAR;
-let calibrated = false;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
 let retryDelay = RETRY_BASE_MS;
@@ -214,7 +205,6 @@ let turnStepOrder: string[] = [];
 let pendingToolStep = new Map<string, string>();
 /** Frozen-estimate cache: recomputed only when new characters arrive. */
 let fbChars = -1;
-let fbRatio = NaN;
 let fbTps = NaN;
 let lastTurn: TurnResult | null = null;
 // Pending permission and question requests for the watched session. OpenCode
@@ -239,7 +229,6 @@ const clearTurn = (): void => {
   turnToolMs = 0;
   toolStartAt = null;
   fbChars = -1;
-  fbRatio = NaN;
   fbTps = NaN;
   for (const id of turnStepOrder) steps.delete(id);
   turnStepOrder = [];
@@ -270,8 +259,6 @@ type SessionState = {
   deltaToolCalls: Set<string>;
   messageChars: Map<string, number>;
   busy: boolean;
-  tokensPerChar: number;
-  calibrated: boolean;
   turnExecAt: number | null;
   turnStartedAt: number | null;
   turnLastCharAt: number | null;
@@ -287,7 +274,6 @@ type SessionState = {
   turnStepOrder: string[];
   pendingToolStep: Map<string, string>;
   fbChars: number;
-  fbRatio: number;
   fbTps: number;
   lastTurn: TurnResult | null;
   turns: TurnPoint[];
@@ -315,8 +301,6 @@ const createSessionState = (sessionId: string): SessionState => ({
   deltaToolCalls: new Set(),
   messageChars: new Map(),
   busy: false,
-  tokensPerChar: DEFAULT_TOKENS_PER_CHAR,
-  calibrated: false,
   turnExecAt: null,
   turnStartedAt: null,
   turnLastCharAt: null,
@@ -332,7 +316,6 @@ const createSessionState = (sessionId: string): SessionState => ({
   turnStepOrder: [],
   pendingToolStep: new Map(),
   fbChars: -1,
-  fbRatio: NaN,
   fbTps: NaN,
   lastTurn: null,
   turns: [],
@@ -392,8 +375,6 @@ const enterSession = (sessionId: string): void => {
   deltaToolCalls = state.deltaToolCalls;
   messageChars = state.messageChars;
   busy = state.busy;
-  tokensPerChar = state.tokensPerChar;
-  calibrated = state.calibrated;
   turnExecAt = state.turnExecAt;
   turnStartedAt = state.turnStartedAt;
   turnLastCharAt = state.turnLastCharAt;
@@ -409,7 +390,6 @@ const enterSession = (sessionId: string): void => {
   turnStepOrder = state.turnStepOrder;
   pendingToolStep = state.pendingToolStep;
   fbChars = state.fbChars;
-  fbRatio = state.fbRatio;
   fbTps = state.fbTps;
   lastTurn = state.lastTurn;
   turns = state.turns;
@@ -428,8 +408,6 @@ const leaveSession = (): void => {
   state.deltaToolCalls = deltaToolCalls;
   state.messageChars = messageChars;
   state.busy = busy;
-  state.tokensPerChar = tokensPerChar;
-  state.calibrated = calibrated;
   state.turnExecAt = turnExecAt;
   state.turnStartedAt = turnStartedAt;
   state.turnLastCharAt = turnLastCharAt;
@@ -445,7 +423,6 @@ const leaveSession = (): void => {
   state.turnStepOrder = turnStepOrder;
   state.pendingToolStep = pendingToolStep;
   state.fbChars = fbChars;
-  state.fbRatio = fbRatio;
   state.fbTps = fbTps;
   state.lastTurn = lastTurn;
   state.turns = turns;
@@ -475,8 +452,6 @@ const statePaths = (): string[] => {
 const memoryOf = (state: SessionState): SessionMemory => ({
   lastTurn: state.lastTurn,
   turns: state.turns.slice(-TURNS_CAP),
-  tokensPerChar: state.tokensPerChar,
-  calibrated: state.calibrated,
 });
 
 /** Read a state file's raw session entries; anything unreadable is just empty. */
@@ -504,15 +479,6 @@ const readPersisted = (): void => {
       const state = createSessionState(id);
       state.lastTurn = memory.lastTurn ?? null;
       state.turns = Array.isArray(memory.turns) ? memory.turns.slice(-TURNS_CAP) : [];
-      // `charsPerToken` was the pre-1.2 name for this ratio, and it really
-      // meant tokens per char. Keep reading it so a restart does not throw away
-      // a session's calibration.
-      const legacy = (raw as Record<string, unknown>).charsPerToken;
-      const savedRatio = memory.tokensPerChar ?? legacy;
-      state.tokensPerChar = typeof savedRatio === 'number' && Number.isFinite(savedRatio)
-        ? savedRatio
-        : DEFAULT_TOKENS_PER_CHAR;
-      state.calibrated = memory.calibrated === true;
       sessionStates.set(id, state);
     }
     return;
@@ -747,7 +713,7 @@ const contributeStep = (step: StepRecord): StepContribution | null => {
     tokens = step.output + step.reasoning;
     real = true;
   } else if (!step.settled && step.chars > 0) {
-    tokens = step.chars * tokensPerChar;
+    tokens = tokensFromChars(step.chars);
     real = false;
   } else {
     return null;
@@ -804,7 +770,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   // No measurable step (typically a late attach): estimate frozen at the last
   // counted character. Recomputed only when new characters arrive, so the
   // number holds instead of sagging while the model thinks.
-  if (turnChars === fbChars && tokensPerChar === fbRatio && Number.isFinite(fbTps)) {
+  if (turnChars === fbChars && Number.isFinite(fbTps)) {
     return { tps: fbTps, source: 'estimate' };
   }
   const ref = turnLastCharAt ?? turnStartedAt;
@@ -820,7 +786,7 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
   // and tool runs, so they are the honest denominator when the reconstruction
   // will not hold.
   const elapsedMs = reconstructed >= 1 ? reconstructed : turnActiveMs;
-  const tps = plausibleRate(turnChars * tokensPerChar, elapsedMs);
+  const tps = plausibleRate(tokensFromChars(turnChars), elapsedMs);
   if (tps === null) {
     // Nothing defensible to freeze: leave the cache empty rather than a number
     // that only looks like a measurement.
@@ -828,7 +794,6 @@ const computeRunning = (): { tps: number; source: 'tokens' | 'estimate' } | null
     return null;
   }
   fbChars = turnChars;
-  fbRatio = tokensPerChar;
   fbTps = tps;
   return { tps, source: 'estimate' };
 };
@@ -865,7 +830,7 @@ const finalizeTurn = (now: number): void => {
     1,
     turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS),
   );
-  const tps = plausibleRate(turnChars * tokensPerChar, activeMs);
+  const tps = plausibleRate(tokensFromChars(turnChars), activeMs);
   if (tps === null) {
     // The window cannot carry a number: keep the previous turn's average
     // rather than publishing one built on a clamped span.
@@ -875,7 +840,7 @@ const finalizeTurn = (now: number): void => {
   lastTurn = {
     tokensPerSecond: tps,
     source: 'estimate',
-    tokens: turnChars * tokensPerChar,
+    tokens: tokensFromChars(turnChars),
     activeMs,
     wallMs,
     ttftMs: turnTtftMs(),
@@ -987,16 +952,6 @@ const readToolCallID = (payload: Record<string, unknown>): string => (
 /** Stable part identity for streamed tool-input fragments. */
 const toolPartID = (messageID: string, callID: string): string => `${messageID}:tool:${callID || 'input'}`;
 
-const calibrate = (messageID: string, output: number, reasoning: number): void => {
-  const chars = messageChars.get(messageID) ?? 0;
-  if (chars < MIN_CALIBRATION_CHARS) return;
-  const generated = output + reasoning;
-  if (!Number.isFinite(generated) || generated <= 0) return;
-  const ratio = Math.min(MAX_TOKENS_PER_CHAR, Math.max(MIN_TOKENS_PER_CHAR, generated / chars));
-  tokensPerChar = tokensPerChar + (ratio - tokensPerChar) * CALIBRATION_WEIGHT;
-  calibrated = true;
-};
-
 /**
  * Settles a step with its provider-reported token counts. Always recorded —
  * even before any character streamed — so early tool-only steps count; the
@@ -1006,7 +961,6 @@ const calibrate = (messageID: string, output: number, reasoning: number): void =
 const settleStep = (messageID: string, output: number, reasoning: number, now: number): void => {
   const generated = output + reasoning;
   if (!messageID || generated <= 0) return;
-  calibrate(messageID, output, reasoning);
   const step = stepFor(messageID, now);
   step.output = output;
   step.reasoning = reasoning;
@@ -1676,7 +1630,7 @@ const computeLive = (now: number): {
     // Not the headline, but a published field: a window whose samples all
     // landed in the same millisecond would otherwise report the same broken
     // rate the estimate path used to.
-    tps: Math.min((chars / (spanMs / 1000)) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND),
+    tps: Math.min(tokensFromChars(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
     chars,
     textChars,
@@ -1709,7 +1663,7 @@ const liveBuckets = (now: number): number[] => {
     // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
     // normalizes by the largest point, so a single such bucket flattened every
     // other point on the curve.
-    out.push(Math.min((chars / (width / 1000)) * tokensPerChar, MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    out.push(Math.min(tokensFromChars(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
   // Trim leading silence so a fresh turn starts drawing immediately.
   let lead = 0;
@@ -1854,7 +1808,6 @@ const server = http.createServer((req, res) => {
         busy,
         waiting: waitingKind(),
         toolActive: toolActive(),
-        calibrated,
         live: computeLive(now),
         running: turnStartedAt !== null ? computeRunning() : null,
         curve: computeCurve(now),
