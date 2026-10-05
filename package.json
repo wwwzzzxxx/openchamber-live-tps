@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "description": "OpenChamber Work Status section: instant live TPS with sparkline, last-turn average, and TTFT.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wwwzzzxxx/openchamber-live-tps.git"
+  },
+  "homepage": "https://github.com/wwwzzzxxx/openchamber-live-tps#readme",
+  "bugs": {
+    "url": "https://github.com/wwwzzzxxx/openchamber-live-tps/issues"
+  },
   "keywords": [
     "openchamber",
     "extension",
