@@ -27,20 +27,20 @@ no tokenizer. See [Counting](#counting).
 
 ## Install
 
-`~/.config/openchamber/extensions/live-tps` is used throughout; any directory works.
+Open **Settings → Extensions**, paste this URL into **Folder, ZIP, or URL**, and
+choose **Add**:
 
-```bash
-mkdir -p ~/.config/openchamber/extensions
-cd ~/.config/openchamber/extensions
-git clone https://github.com/wwwzzzxxx/openchamber-live-tps.git live-tps
-cd live-tps
-bun install
-bun run build
+```text
+https://github.com/wwwzzzxxx/openchamber-live-tps
 ```
 
-Then start OpenChamber and approve the local service once in **Settings →
-Extensions** — every surface (desktop, browser, mobile) asks separately, and
-asking again after the service restarts is normal.
+Approve the local service. The repository includes the built JavaScript files,
+so Git installation needs no dependency install or build. OpenChamber offers an
+update when the repository publishes a newer package version. Extensions load
+in the desktop and web clients, not VS Code or mobile.
+
+For development, clone the repository, run `bun install` and `bun run build`,
+then add the checkout's absolute path in **Settings → Extensions**.
 
 A Gitee mirror is at `https://gitee.com/pzwzx/openchamber-live-tps` if GitHub is
 slow.
@@ -120,6 +120,13 @@ OpenChamber server ─────────────▶ service/  (runs in
 Both guests self-heal: if the service was restarted they notice `sessionId: null`
 in a `/rate` answer and re-assert `/watch`, which lets the host bring the service
 back.
+
+On a password-protected host, the service signs in using the local instance's
+stored password, or uses the desktop's local client token. Credentials stay in
+the service and are sent only to a loopback port owned by its parent process.
+Login and event requests do not follow redirects. A custom host data directory
+must be visible to the service through `OPENCHAMBER_DATA_DIR`; the default is
+`~/.config/openchamber`.
 
 The service also discovers its own event-stream origin by probing the parent
 process's loopback ports for `/api/global/event`, so an SSH tunnel to a remote

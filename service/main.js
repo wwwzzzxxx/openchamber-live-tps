@@ -1,8 +1,8 @@
 // service/main.ts
 import http from "node:http";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import fs2 from "node:fs";
+import os2 from "node:os";
+import path2 from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -13,6 +13,49 @@ var tokensFromChars = (chars, algorithm = "heuristic") => {
   if (!Number.isFinite(chars) || chars <= 0)
     return 0;
   return Math.ceil(chars / (algorithm === "code" ? CHARS_DIV_3 : CHARS_DIV_4));
+};
+
+// service/auth.ts
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+var readRecord = async (file) => {
+  try {
+    const value = JSON.parse(await fs.readFile(file, "utf8"));
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+};
+var localAuthHeaders = async (origin, parentPorts, signal) => {
+  const url = new URL(origin);
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname))
+    return {};
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  if (!parentPorts.has(port))
+    return {};
+  const dataDir = process.env.OPENCHAMBER_DATA_DIR || path.join(os.homedir(), ".config", "openchamber");
+  const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
+  if (typeof instance.uiPassword === "string" && instance.uiPassword) {
+    try {
+      const response = await fetch(new URL("/auth/session", origin), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ password: instance.uiPassword }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+        redirect: "manual"
+      });
+      const cookie = response.headers.get("set-cookie")?.match(/(?:^|,\s*)(oc_ui_session(?:_\d+)?=[^;]+)/)?.[1];
+      await response.body?.cancel();
+      if (response.ok && cookie)
+        return { Cookie: cookie };
+    } catch {}
+  }
+  const settings = await readRecord(path.join(dataDir, "settings.json"));
+  if (settings.desktopLocalPort === port && typeof settings.desktopLocalClientToken === "string" && settings.desktopLocalClientToken) {
+    return { Authorization: `Bearer ${settings.desktopLocalClientToken}` };
+  }
+  return {};
 };
 
 // service/main.ts
@@ -115,6 +158,7 @@ var watched = new Set;
 var TRACKED_CAP = SESSIONS_CAP;
 var createSessionState = (sessionId) => ({
   sessionId,
+  currentModel: "*",
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map,
@@ -181,6 +225,7 @@ var enterSession = (sessionId) => {
   activeSession = state;
   activeSessionId = sessionId;
   inSession = true;
+  currentModel = state.currentModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -212,6 +257,7 @@ var leaveSession = () => {
   if (!inSession)
     return;
   const state = activeSession;
+  state.currentModel = currentModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -247,8 +293,8 @@ var statePaths = () => {
   if (override)
     return [override];
   const entry = process.argv[1];
-  const beside = entry ? path.dirname(entry) : process.cwd();
-  return [path.join(beside, ".live-tps-state.json"), path.join(os.tmpdir(), "openchamber-live-tps-state.json")];
+  const beside = entry ? path2.dirname(entry) : process.cwd();
+  return [path2.join(beside, ".live-tps-state.json"), path2.join(os2.tmpdir(), "openchamber-live-tps-state.json")];
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
@@ -256,7 +302,7 @@ var memoryOf = (state) => ({
 });
 var readSessions = (file) => {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
       return {};
     const out = {};
@@ -271,7 +317,7 @@ var readSessions = (file) => {
 };
 var readModels = (file) => {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     const out = {};
     const models = parsed && typeof parsed.models === "object" ? parsed.models : null;
     if (models) {
@@ -323,8 +369,8 @@ var writePersisted = () => {
         models: { ...readModels(file), ...Object.fromEntries(calibration) }
       });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, payload, "utf8");
-      fs.renameSync(tmp, file);
+      fs2.writeFileSync(tmp, payload, "utf8");
+      fs2.renameSync(tmp, file);
       return;
     } catch {}
   }
@@ -638,7 +684,7 @@ var recordChars = (messageID, partID, kind, chars, now) => {
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
 var readString = (value) => typeof value === "string" ? value : "";
 var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
-var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+var readRecord2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 var fragmentPartID = (messageID, kind, ordinal) => {
   if (!messageID)
     return "";
@@ -668,13 +714,13 @@ var settleStep = (messageID, output, reasoning, now) => {
   closeStepTool(step, now);
 };
 var eventSessionID = (event) => {
-  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
   if (!payload)
     return null;
   const direct = readString(payload.sessionID);
   if (direct)
     return direct;
-  const form = readRecord(payload.form);
+  const form = readRecord2(payload.form);
   return form ? readString(form.sessionID) : "";
 };
 var handleEvent = (event, now) => {
@@ -692,7 +738,7 @@ var dispatchEvent = (event, now) => {
   const type = normType(readString(event.type));
   if (!type)
     return;
-  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
   if (!payload)
     return;
   if (type === "session.text.delta" || type === "session.reasoning.delta") {
@@ -873,7 +919,7 @@ var dispatchEvent = (event, now) => {
     if (!isWatchedSession(payload.sessionID))
       return;
     markActive(now);
-    const tokens = readRecord(payload.tokens);
+    const tokens = readRecord2(payload.tokens);
     if (!tokens)
       return;
     settleStep(readString(payload.assistantMessageID), readNumber(tokens.output), readNumber(tokens.reasoning), now);
@@ -929,7 +975,7 @@ var dispatchEvent = (event, now) => {
     return;
   }
   if (type === "form.created") {
-    const form = readRecord(payload.form);
+    const form = readRecord2(payload.form);
     if (!form || !isWatchedSession(form.sessionID))
       return;
     const requestId = readString(form.id);
@@ -968,7 +1014,7 @@ var dispatchEvent = (event, now) => {
   if (type === "session.status") {
     if (!isWatchedSession(payload.sessionID))
       return;
-    const status = readRecord(payload.status);
+    const status = readRecord2(payload.status);
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
@@ -1019,9 +1065,9 @@ var parseEndpoint = (value) => {
     return { host: plain[1], port: Number(plain[2]) };
   return null;
 };
-var toOrigin = (scheme, host, port2) => {
+var toOrigin = (scheme, host, port) => {
   const dial = host === "" || host === "*" || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port2}`;
+  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port}`;
 };
 var runFile = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, {
@@ -1101,7 +1147,8 @@ var probeEventStream = async (origin, signal) => {
   try {
     const response = await fetch(new URL("/api/global/event", origin), {
       headers: { Accept: "text/event-stream" },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)])
+      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
+      redirect: "manual"
     });
     const body = response.body;
     if (body)
@@ -1180,8 +1227,23 @@ var startStream = async (tried = new Set) => {
     try {
       response = await fetch(new URL("/api/global/event", origin), {
         headers: { Accept: "text/event-stream" },
-        signal: local.signal
+        signal: local.signal,
+        redirect: "manual"
       });
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel();
+        const endpoints = await parentListenEndpoints();
+        const headers = await localAuthHeaders(origin, new Set(endpoints.map((endpoint) => endpoint.port)), local.signal);
+        if (local.signal.aborted)
+          return;
+        if (Object.keys(headers).length > 0) {
+          response = await fetch(new URL("/api/global/event", origin), {
+            headers: { Accept: "text/event-stream", ...headers },
+            signal: local.signal,
+            redirect: "manual"
+          });
+        }
+      }
     } catch (error) {
       if (local.signal.aborted)
         return;
@@ -1190,8 +1252,10 @@ var startStream = async (tried = new Set) => {
       continue;
     }
     if (!response.ok || !response.body) {
-      scheduleReconnect(`Event stream answered HTTP ${response.status}`, "http");
-      return;
+      lastError = `Event stream answered HTTP ${response.status}`;
+      lastErrorKind = "http";
+      await response.body?.cancel();
+      continue;
     }
     connection = "live";
     retryDelay = RETRY_BASE_MS;
@@ -1238,7 +1302,7 @@ var startStream = async (tried = new Set) => {
     await startStream(seen);
     return;
   }
-  scheduleReconnect(lastError ?? "Event stream unreachable", "network");
+  scheduleReconnect(lastError ?? "Event stream unreachable", lastErrorKind ?? "network");
 };
 var beginStream = () => {
   startStream().catch((error) => {
