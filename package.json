@@ -50,7 +50,7 @@
     "build:status": "bunx openchamber-guest-bundle status/main.ts status/main.js",
     "build:panel": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
     "build:service": "bunx openchamber-guest-bundle --node service/main.ts service/main.js",
-    "test": "node scripts/smoke.mjs"
+    "test": "node scripts/smoke.mjs && node scripts/regressions.mjs"
   },
   "dependencies": {
     "@openchamber/sdk": "2.0.4"

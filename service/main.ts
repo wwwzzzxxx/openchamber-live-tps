@@ -25,6 +25,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tokensFromChars } from '../shared/tokens';
+import { localAuthHeaders } from './auth';
 
 const execFileAsync = promisify(execFile);
 
@@ -281,6 +282,7 @@ let turns: TurnPoint[] = [];
  */
 type SessionState = {
   sessionId: string;
+  currentModel: string;
   /** Last time this record was touched; drives the tracked-session cap. */
   lastSeenAt: number;
   samples: Sample[];
@@ -324,6 +326,7 @@ const TRACKED_CAP = SESSIONS_CAP;
 
 const createSessionState = (sessionId: string): SessionState => ({
   sessionId,
+  currentModel: '*',
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map(),
@@ -399,6 +402,7 @@ const enterSession = (sessionId: string): void => {
   activeSession = state;
   activeSessionId = sessionId;
   inSession = true;
+  currentModel = state.currentModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -431,6 +435,7 @@ const enterSession = (sessionId: string): void => {
 const leaveSession = (): void => {
   if (!inSession) return;
   const state = activeSession;
+  state.currentModel = currentModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -1499,6 +1504,7 @@ const probeEventStream = async (origin: string, signal: AbortSignal): Promise<'s
     const response = await fetch(new URL('/api/global/event', origin), {
       headers: { Accept: 'text/event-stream' },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
+      redirect: 'manual',
     });
     const body = response.body;
     if (body) void body.cancel().catch(() => undefined);
@@ -1586,7 +1592,21 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       response = await fetch(new URL('/api/global/event', origin), {
         headers: { Accept: 'text/event-stream' },
         signal: local.signal,
+        redirect: 'manual',
       });
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel();
+        const endpoints = await parentListenEndpoints();
+        const headers = await localAuthHeaders(origin, new Set(endpoints.map((endpoint) => endpoint.port)), local.signal);
+        if (local.signal.aborted) return;
+        if (Object.keys(headers).length > 0) {
+          response = await fetch(new URL('/api/global/event', origin), {
+            headers: { Accept: 'text/event-stream', ...headers },
+            signal: local.signal,
+            redirect: 'manual',
+          });
+        }
+      }
     } catch (error) {
       if (local.signal.aborted) return;
       lastError = error instanceof Error ? error.message : String(error);
@@ -1594,8 +1614,10 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       continue;
     }
     if (!response.ok || !response.body) {
-      scheduleReconnect(`Event stream answered HTTP ${response.status}`, 'http');
-      return;
+      lastError = `Event stream answered HTTP ${response.status}`;
+      lastErrorKind = 'http';
+      await response.body?.cancel();
+      continue;
     }
     connection = 'live';
     retryDelay = RETRY_BASE_MS;
@@ -1637,7 +1659,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
     await startStream(seen);
     return;
   }
-  scheduleReconnect(lastError ?? 'Event stream unreachable', 'network');
+  scheduleReconnect(lastError ?? 'Event stream unreachable', lastErrorKind ?? 'network');
 };
 
 /**
