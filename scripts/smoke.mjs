@@ -284,11 +284,18 @@ rate = await (await svcFetch('/rate')).json();
 check('zero-token step adds no tokens', rate.lastTurn?.tokens === 60, JSON.stringify(rate.lastTurn));
 check('zero-token step adds no time', rate.lastTurn?.activeMs < 700, JSON.stringify(rate.lastTurn));
 
-// --- turn 8: unreported reasoning time is excluded ---------------------------
+// --- turn 8: reasoning time is generation time ------------------------------
+// The reasoning span used to be subtracted from the divisor whenever the
+// provider reported `reasoning: 0`, on the theory that the time produced
+// nothing countable. It does: providers fold reasoning tokens into `output`
+// (every `step.ended` in a 200 s capture reported `reasoning: 0` while
+// streaming thousands of reasoning characters, and `output` matched chars/4
+// across reasoning plus text together). Subtracting it counted the same tokens
+// twice and inflated one session from 74 to 218 tok/s.
 ev('session.execution.started', { sessionID: SESSION });
 ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msg8' });
 ev('session.reasoning.delta', { sessionID: SESSION, assistantMessageID: 'msg8', ordinal: 0, delta: 'r'.repeat(40) });
-await sleep(500); // reasoning streams half a second but settles zero reasoning tokens
+await sleep(500); // reasoning streams half a second and settles inside `output`
 ev('session.reasoning.delta', { sessionID: SESSION, assistantMessageID: 'msg8', ordinal: 0, delta: 'r'.repeat(40) });
 ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg8', ordinal: 0, delta: 't'.repeat(40) });
 await sleep(300); // then a measurable text phase settles 50 output tokens
@@ -297,10 +304,51 @@ ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msg8', token
 ev('session.execution.succeeded', { sessionID: SESSION });
 await sleep(150);
 rate = await (await svcFetch('/rate')).json();
-check('unreported reasoning still tokens-based', rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokens === 50, JSON.stringify(rate.lastTurn));
+check('reasoning turn stays tokens-based', rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokens === 50, JSON.stringify(rate.lastTurn));
 check(
-  'unreported reasoning span excluded, text phase kept',
-  rate.lastTurn?.activeMs >= 200 && rate.lastTurn?.activeMs < 500,
+  'reasoning span counts as generation time',
+  (rate.lastTurn?.activeMs ?? 0) >= 700,
+  `activeMs=${rate.lastTurn?.activeMs}`,
+);
+
+// --- turn 8b: a step published after it began ------------------------------
+// OpenCode 2 publishes `session.step.started` once the step produces output, so
+// the event lands one model-latency after `started` (6.2 s on the session this
+// was found in). Anchoring the step at arrival drops that latency from the
+// divisor — 151.9 tok/s where the events say 30.6 — and reports the delivery
+// interval as time to first token.
+ev('session.execution.started', { sessionID: SESSION });
+const lateStepAt = Date.now();
+emit({
+  id: 'e',
+  created: Date.now() + 2000, // published 2 s after the step really began
+  type: 'session.step.started',
+  data: {
+    sessionID: SESSION,
+    assistantMessageID: 'msg8b',
+    started: lateStepAt,
+    // v2 carries the model as an object; a plain string read misses it and
+    // every model then shares one wildcard calibration entry.
+    model: { id: 'smoke-model', providerID: 'smoke', variant: 'default' },
+  },
+});
+await sleep(400); // the step's first output arrives 2.4 s after it began
+for (let i = 0; i < 4; i += 1) {
+  ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg8b', ordinal: 0, delta: 'L'.repeat(200) });
+  await sleep(100); // 400 ms of generation after the first token
+}
+ev('session.step.ended', { sessionID: SESSION, assistantMessageID: 'msg8b', tokens: { output: 100, reasoning: 0 } });
+ev('session.execution.succeeded', { sessionID: SESSION });
+await sleep(150);
+rate = await (await svcFetch('/rate')).json();
+check(
+  'ttft is the real delay, not the delivery interval',
+  (rate.lastTurn?.ttftMs ?? 0) > 1500,
+  `ttft=${rate.lastTurn?.ttftMs}`,
+);
+check(
+  'time to first token is not in the divisor',
+  rate.lastTurn?.source === 'tokens' && rate.lastTurn?.tokensPerSecond > 150,
   JSON.stringify(rate.lastTurn),
 );
 
@@ -420,7 +468,7 @@ await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOri
 await sleep(200);
 rate = await (await svcFetch('/rate')).json();
 check('switching back restores last turn', rate.lastTurn?.tokensPerSecond === firstTurnTps, JSON.stringify(rate.lastTurn));
-check('switching back restores curve', Array.isArray(rate.curve) && rate.curve.length > 0, JSON.stringify(rate.curve));
+check('switching back restores the live curve', Array.isArray(rate.curve) && rate.curve.length > 0, JSON.stringify(rate.curve));
 
 // --- two surfaces at once: neither disturbs the other ------------------------
 // The status page and a second surface (another window, or a second panel) can
@@ -537,6 +585,43 @@ check(
     && streamingRate.curve.every((v) => Number.isFinite(v) && v <= 5000),
   JSON.stringify(streamingRate.curve),
 );
+// The curve used to drop its zero buckets, so the point count moved between 0
+// and 8 every poll and the sparkline's x-axis and scale jumped with it. A
+// fixed number of fixed-width buckets holds both still.
+const curveLengths = [];
+for (let i = 0; i < 4; i += 1) {
+  curveLengths.push((await (await svcFetch('/rate')).json()).curve.length);
+  await sleep(120);
+}
+check(
+  'curve holds a fixed number of points across polls',
+  curveLengths.every((n) => n === curveLengths[0] && n > 1),
+  JSON.stringify(curveLengths),
+);
+ev('session.execution.succeeded', { sessionID: SESSION });
+await sleep(150);
+
+// --- turn 17b: a backfilled tool input must not spike the curve ------------
+// This stream carries no `tool.input.delta`, so `tool.input.ended` replays the
+// whole argument string in one sample. At 83 ms a bucket that read as ~12 000
+// tok/s, clamped to 5000, and hijacked the normalization for that poll.
+ev('session.execution.started', { sessionID: SESSION });
+ev('session.step.started', { sessionID: SESSION, assistantMessageID: 'msgS' });
+ev('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msgS', ordinal: 0, delta: 's'.repeat(60) });
+await sleep(150);
+ev('session.tool.input.ended', {
+  sessionID: SESSION,
+  assistantMessageID: 'msgS',
+  id: 'toolBackfill',
+  text: `{"command":"${'x'.repeat(2000)}"}`,
+});
+await sleep(150);
+const backfillRate = await (await svcFetch('/rate')).json();
+check(
+  'a backfilled tool input does not spike the curve',
+  Array.isArray(backfillRate.curve) && Math.max(...backfillRate.curve) < 2000,
+  JSON.stringify(backfillRate.curve),
+);
 ev('session.execution.succeeded', { sessionID: SESSION });
 await sleep(150);
 
@@ -611,6 +696,14 @@ ev('session.execution.succeeded', { sessionID: SESSION });
 await sleep(1800); // let the debounced write land
 const beforeRestart = (await (await svcFetch(`/rate?sessionId=${SESSION}`)).json()).lastTurn;
 check('last turn present before restart', Boolean(beforeRestart), JSON.stringify(beforeRestart));
+// The model id arrives as an object, so a plain string read returned '' and
+// every model shared one wildcard calibration entry.
+const persistedModels = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).models ?? {};
+check(
+  'calibration is learned under the real model id',
+  typeof persistedModels['smoke-model'] === 'number',
+  JSON.stringify(persistedModels),
+);
 svc.kill();
 await once(svc, 'exit');
 await sleep(300);
@@ -650,8 +743,8 @@ check(
   JSON.stringify(cold?.lastTurn),
 );
 check(
-  'restart: curve restored from disk',
-  Array.isArray(cold?.curve) && cold.curve.length > 0,
+  'restart: the curve keeps its shape instead of vanishing',
+  Array.isArray(cold?.curve) && cold.curve.length === 24 && cold.curve.every((v) => v === 0),
   JSON.stringify(cold?.curve),
 );
 await svc2Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
@@ -659,6 +752,82 @@ await sleep(300);
 const warm = await (await svc2Fetch(`/rate?sessionId=${SESSION}`)).json();
 check('restart: watching again marks it live', warm.sessionId === SESSION, `sessionId=${warm.sessionId}`);
 svc2.kill();
+await once(svc2, 'exit');
+
+// --- a UI password locks the service out; the local client token lets it in -
+// The SDK keeps host secrets out of the service environment, so when the user
+// sets a UI password every /api/* route answers 401 and this service has no
+// credentialed channel left. OpenChamber's own CLI solves the same problem by
+// reading desktopLocalClientToken out of the data directory's settings.json;
+// the service does the same and sends it as a bearer.
+const seenAuth = [];
+const authSse = http.createServer((req, res) => {
+  seenAuth.push(req.headers.authorization ?? null);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.flushHeaders();
+  req.on('close', () => undefined);
+});
+await new Promise((r) => authSse.listen(0, '127.0.0.1', r));
+const authOrigin = `http://127.0.0.1:${authSse.address().port}`;
+const fakeDataDir = path.join(os.tmpdir(), `live-tps-auth-${process.pid}`);
+fs.mkdirSync(fakeDataDir, { recursive: true });
+fs.writeFileSync(path.join(fakeDataDir, 'settings.json'), JSON.stringify({ desktopLocalClientToken: 'oc_client_smoke' }));
+const svc3 = spawn(process.execPath, ['service/main.js'], {
+  env: {
+    ...process.env,
+    OPENCHAMBER_SERVICE_PORT: String(svcPort),
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: fakeDataDir,
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+svc3.stderr.on('data', (d) => process.stderr.write(`[service3] ${d}`));
+const svc3Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
+  ...init,
+  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+});
+let ready3 = false;
+for (let i = 0; i < 50 && !ready3; i += 1) {
+  try { ready3 = (await svc3Fetch('/health')).ok; } catch { /* not yet */ }
+  if (!ready3) await sleep(100);
+}
+await svc3Fetch('/watch', { method: 'POST', body: JSON.stringify({ origin: authOrigin, sessionId: SESSION }) });
+await sleep(600);
+check(
+  'the local client token is sent to the event stream',
+  seenAuth.some((v) => v === 'Bearer oc_client_smoke'),
+  JSON.stringify(seenAuth),
+);
+svc3.kill();
+await once(svc3, 'exit');
+fs.rmSync(fakeDataDir, { recursive: true, force: true });
+authSse.close();
+
+// An explicit override wins over the file, and a missing file is not an error.
+const svc4 = spawn(process.execPath, ['service/main.js'], {
+  env: {
+    ...process.env,
+    OPENCHAMBER_SERVICE_PORT: String(svcPort),
+    OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+    OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
+    OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `live-tps-nope-${process.pid}`),
+    OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN: 'oc_client_override',
+  },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+const svc4Fetch = (p, init) => fetch(`http://127.0.0.1:${svcPort}${p}`, {
+  ...init,
+  headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+});
+let ready4 = false;
+for (let i = 0; i < 50 && !ready4; i += 1) {
+  try { ready4 = (await svc4Fetch('/health')).ok; } catch { /* not yet */ }
+  if (!ready4) await sleep(100);
+}
+check('a missing settings file still starts the service', ready4);
+svc4.kill();
+await once(svc4, 'exit');
 
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
 svc.kill();

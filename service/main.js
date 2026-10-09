@@ -17,6 +17,29 @@ var tokensFromChars = (chars, algorithm = "heuristic") => {
 
 // service/main.ts
 var execFileAsync = promisify(execFile);
+var dataDir = () => {
+  const override = process.env.OPENCHAMBER_DATA_DIR;
+  if (override && override.trim())
+    return path.resolve(override.trim());
+  return path.join(os.homedir(), ".config", "openchamber");
+};
+var readClientToken = () => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN;
+  if (override && override.trim())
+    return override.trim();
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), "settings.json"), "utf8"));
+    const value = raw?.desktopLocalClientToken;
+    if (typeof value === "string" && value.trim())
+      return value.trim();
+  } catch {
+  }
+  return "";
+};
+var serverHeaders = () => {
+  const token = readClientToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
 if (!Number.isInteger(port) || port <= 0 || !token) {
@@ -24,7 +47,9 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   process.exit(1);
 }
 var WINDOW_MS = 1000;
-var SAMPLE_LIMIT = 5000;
+var CURVE_WINDOW_MS = 3e4;
+var CURVE_BUCKETS = 24;
+var SAMPLE_LIMIT = 2e4;
 var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
 var PROBE_TIMEOUT_MS = 2000;
@@ -52,7 +77,6 @@ var calibrate = (model, chars, generated) => {
 var MAX_STREAM_GAP_MS = 1000;
 var TURNS_CAP = 30;
 var SESSIONS_CAP = 20;
-var CURVE_BUCKETS = 12;
 var PERSIST_DEBOUNCE_MS = 1500;
 var PERSIST_VERSION = 1;
 var samples = [];
@@ -408,9 +432,7 @@ var stepFor = (messageID, now) => {
       firstCharAt: null,
       chars: 0,
       lastDeltaAt: null,
-      reasoningChars: 0,
-      firstReasoningAt: null,
-      lastReasoningAt: null,
+      sawReasoning: false,
       toolSpans: [],
       toolOpen: 0,
       toolSince: null
@@ -450,11 +472,7 @@ var stepToolWithinMs = (step, fromMs, toMs) => {
   return total;
 };
 var stepReasoningExclMs = (step) => {
-  if (!step.settled || step.reasoning !== 0 || step.reasoningChars === 0)
-    return 0;
-  if (step.firstReasoningAt === null || step.lastReasoningAt === null)
-    return 0;
-  return Math.max(0, step.lastReasoningAt - step.firstReasoningAt);
+  return 0;
 };
 var MAX_PLAUSIBLE_TOKENS_PER_SECOND = 5000;
 var plausibleRate = (tokens, ms) => {
@@ -463,11 +481,19 @@ var plausibleRate = (tokens, ms) => {
   const tps = tokens / (ms / 1000);
   return tps > MAX_PLAUSIBLE_TOKENS_PER_SECOND ? null : tps;
 };
+var generationStart = (step) => {
+  if (step.firstCharAt === null)
+    return step.startAt;
+  if (step.reasoning > 0 && !step.sawReasoning)
+    return step.startAt;
+  return step.firstCharAt;
+};
 var contributeStep = (step) => {
   if (!step.startObserved)
     return null;
+  const genStart = generationStart(step);
   const endRef = step.endAt ?? step.lastDeltaAt ?? step.startAt;
-  const netMs = Math.max(0, endRef - step.startAt) - stepToolWithinMs(step, step.startAt, endRef) - stepReasoningExclMs(step);
+  const netMs = Math.max(0, endRef - genStart) - stepToolWithinMs(step, genStart, endRef) - stepReasoningExclMs(step);
   if (!(netMs >= 1))
     return null;
   let tokens;
@@ -591,7 +617,7 @@ var finalizeTurn = (now) => {
 };
 var pruneSamples = (now) => {
   let expired = 0;
-  while (expired < samples.length && now - samples[expired].at > WINDOW_MS) {
+  while (expired < samples.length && now - samples[expired].at > CURVE_WINDOW_MS) {
     expired += 1;
   }
   if (expired > 0)
@@ -627,12 +653,8 @@ var recordChars = (messageID, partID, kind, chars, now) => {
     step.lastDeltaAt = now;
     if (step.firstCharAt === null)
       step.firstCharAt = now;
-    if (kind === "reasoning") {
-      step.reasoningChars += chars;
-      if (step.firstReasoningAt === null)
-        step.firstReasoningAt = now;
-      step.lastReasoningAt = now;
-    }
+    if (kind === "reasoning")
+      step.sawReasoning = true;
   }
 };
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
@@ -857,7 +879,7 @@ var dispatchEvent = (event, now) => {
     const messageID = readString(payload.assistantMessageID);
     if (!messageID)
       return;
-    const model = readString(payload.modelID) || readString(payload.model);
+    const model = readString(payload.modelID) || readString(readRecord(payload.model)?.id);
     if (model)
       currentModel = model;
     const existing = steps.get(messageID);
@@ -865,7 +887,10 @@ var dispatchEvent = (event, now) => {
       steps.delete(messageID);
       turnStepOrder = turnStepOrder.filter((id) => id !== messageID);
     }
-    stepFor(messageID, now).startObserved = true;
+    const serverCreated = readNumber(event.created) || now;
+    const started = readNumber(payload.started);
+    const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
+    stepFor(messageID, startAt).startObserved = true;
     lastEventAt = now;
     return;
   }
@@ -1100,7 +1125,7 @@ var parentListenEndpoints = async () => {
 var probeEventStream = async (origin, signal) => {
   try {
     const response = await fetch(new URL("/api/global/event", origin), {
-      headers: { Accept: "text/event-stream" },
+      headers: { Accept: "text/event-stream", ...serverHeaders() },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)])
     });
     const body = response.body;
@@ -1179,7 +1204,7 @@ var startStream = async (tried = new Set) => {
     let response;
     try {
       response = await fetch(new URL("/api/global/event", origin), {
-        headers: { Accept: "text/event-stream" },
+        headers: { Accept: "text/event-stream", ...serverHeaders() },
         signal: local.signal
       });
     } catch (error) {
@@ -1256,15 +1281,15 @@ var stopStream = () => {
 };
 var computeLive = (now) => {
   pruneSamples(now);
-  if (samples.length === 0) {
-    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
-  }
-  const spanMs = Math.max(1, Math.min(WINDOW_MS, now - samples[0].at));
+  const from = now - WINDOW_MS;
   let chars = 0;
   let textChars = 0;
   let reasoningChars = 0;
   let toolChars = 0;
+  let oldest = now;
   for (const sample of samples) {
+    if (sample.at < from)
+      continue;
     chars += sample.chars;
     if (sample.kind === "reasoning")
       reasoningChars += sample.chars;
@@ -1272,7 +1297,13 @@ var computeLive = (now) => {
       toolChars += sample.chars;
     else
       textChars += sample.chars;
+    if (sample.at < oldest)
+      oldest = sample.at;
   }
+  if (chars === 0) {
+    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
+  }
+  const spanMs = Math.max(1, Math.min(WINDOW_MS, now - oldest));
   return {
     tps: Math.min(estimateTokens(chars) / (spanMs / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND),
     spanMs,
@@ -1282,12 +1313,10 @@ var computeLive = (now) => {
     toolChars
   };
 };
-var liveBuckets = (now) => {
+var computeCurve = (now) => {
   pruneSamples(now);
-  if (samples.length === 0)
-    return [];
-  const width = WINDOW_MS / CURVE_BUCKETS;
-  const oldest = now - WINDOW_MS;
+  const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
+  const oldest = now - CURVE_WINDOW_MS;
   const out = [];
   for (let b = 0;b < CURVE_BUCKETS; b += 1) {
     const from = oldest + b * width;
@@ -1298,25 +1327,9 @@ var liveBuckets = (now) => {
         continue;
       chars += sample.chars;
     }
-    if (chars === 0) {
-      out.push(0);
-      continue;
-    }
     out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
-  let lead = 0;
-  while (lead < out.length && out[lead] <= 0)
-    lead += 1;
-  return out.slice(lead);
-};
-var computeCurve = (now) => {
-  const past = turns.slice(-16).map((t) => t.tps);
-  if (!busy || waitingKind() !== null)
-    return past;
-  const live = liveBuckets(now).filter((v) => v > 0);
-  if (live.length === 0)
-    return past;
-  return [...past.slice(-8), ...live].slice(-(CURVE_BUCKETS * 2));
+  return out;
 };
 var isHttpOrigin = (value) => {
   try {

@@ -28,6 +28,51 @@ import { tokensFromChars } from '../shared/tokens';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * OpenChamber's data directory, and the loopback client token inside it.
+ *
+ * The SDK is explicit that a service never inherits the host environment:
+ * "API keys, the UI password, and other host secrets never reach it". That
+ * leaves a service with no credentialed channel to the server API, which does
+ * not matter until the user sets a UI password - at which point every /api/*
+ * route answers 401 and this service goes dark with nothing in the panel but
+ * an error string.
+ *
+ * desktopLocalClientToken is the local-only credential the OpenChamber CLI
+ * itself reads from the same file to make desktop-local API calls. It is not
+ * the UI password, it only means anything to an OpenChamber running on this
+ * machine, and it is absent on a headless install - where the stream is
+ * unauthenticated anyway. OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN overrides the
+ * lookup for an install that would rather pass it in.
+ */
+const dataDir = (): string => {
+  const override = process.env.OPENCHAMBER_DATA_DIR;
+  if (override && override.trim()) return path.resolve(override.trim());
+  return path.join(os.homedir(), '.config', 'openchamber');
+};
+
+const readClientToken = (): string => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN;
+  if (override && override.trim()) return override.trim();
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8')) as {
+      desktopLocalClientToken?: unknown;
+    };
+    const value = raw?.desktopLocalClientToken;
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  } catch {
+    // No desktop settings here: a headless server has no UI password either,
+    // so an empty token is the right answer rather than a failure.
+  }
+  return '';
+};
+
+/** Headers for a dial to the OpenChamber server: the local client token when there is one. */
+const serverHeaders = (): Record<string, string> => {
+  const token = readClientToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
+
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
 if (!Number.isInteger(port) || port <= 0 || !token) {
@@ -41,8 +86,16 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
  * remaining samples actually cover, never more than this.
  */
 const WINDOW_MS = 1_000;
-/** Hard cap on retained delta samples; one second of chunks fits far below this. */
-const SAMPLE_LIMIT = 5_000;
+/**
+ * How far back the drawn curve reaches. Long enough to read a shape out of a
+ * stream that arrives in ~150 ms batches, short of the minute a reader would
+ * still call "now".
+ */
+const CURVE_WINDOW_MS = 30_000;
+/** Points on the drawn curve, one per bucket of `CURVE_WINDOW_MS`. */
+const CURVE_BUCKETS = 24;
+/** Hard cap on retained delta samples; half a minute of chunks fits far below this. */
+const SAMPLE_LIMIT = 20_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 15_000;
 /** A candidate origin that accepts the connection but never answers is written off here. */
@@ -134,8 +187,6 @@ type SessionMemory = {
 const TURNS_CAP = 30;
 /** Sessions remembered; oldest evicted past this. */
 const SESSIONS_CAP = 20;
-/** Live buckets drawn for the current window. */
-const CURVE_BUCKETS = 12;
 /** How long a change waits before it is written, so a burst of events coalesces. */
 const PERSIST_DEBOUNCE_MS = 1_500;
 /** On-disk schema version; a mismatch discards the file instead of guessing. */
@@ -204,8 +255,11 @@ let turnToolMs = 0;
 let toolStartAt: number | null = null;
 
 /**
- * One assistant step (`assistantMessageID`) of the current turn. Durations
- * use local arrival times; a step whose `step.started` was missed is marked
+ * One assistant step (`assistantMessageID`) of the current turn.
+ *
+ * `startAt` is the step's real start, taken from the event's own `started`
+ * field rather than from when the event arrived — see the `step.started`
+ * handler. A step whose `step.started` was missed is marked
  * `startObserved: false` and excluded from measured averages.
  */
 type StepRecord = {
@@ -220,9 +274,8 @@ type StepRecord = {
   chars: number;
   /** Arrival of the latest counted delta; open steps freeze their span here. */
   lastDeltaAt: number | null;
-  reasoningChars: number;
-  firstReasoningAt: number | null;
-  lastReasoningAt: number | null;
+  /** Whether any reasoning delta was counted; see `generationStart`. */
+  sawReasoning: boolean;
   /** Closed tool intervals within this step; overlapping calls merge by counter. */
   toolSpans: Array<[number, number]>;
   toolOpen: number;
@@ -264,7 +317,13 @@ const clearTurn = (): void => {
   turnStepOrder = [];
 };
 
-/** Finished-turn curve of the watched session, oldest first. */
+/**
+ * Finished turns of the watched session, oldest first.
+ *
+ * Kept on disk as the session's measured history and the source of `lastTurn`.
+ * Not drawn: the sparkline shows the live rate window, and a point per turn
+ * next to a point per bucket is two time bases on one axis.
+ */
 let turns: TurnPoint[] = [];
 
 /**
@@ -669,9 +728,7 @@ const stepFor = (messageID: string, now: number): StepRecord => {
       firstCharAt: null,
       chars: 0,
       lastDeltaAt: null,
-      reasoningChars: 0,
-      firstReasoningAt: null,
-      lastReasoningAt: null,
+      sawReasoning: false,
       toolSpans: [],
       toolOpen: 0,
       toolSince: null,
@@ -715,15 +772,19 @@ const stepToolWithinMs = (step: StepRecord, fromMs: number, toMs: number): numbe
 };
 
 /**
- * Reasoning span excluded from a step: the model streamed reasoning but the
- * settled counts report none, so that time produced no countable tokens.
- * Only applies to settled steps; an open step's reasoning may still settle.
+ * Reasoning span excluded from a step.
+ *
+ * Nothing is excluded. Providers fold reasoning tokens into `output` — every
+ * `session.step.ended` in a 200 s capture of three sessions reported
+ * `reasoning: 0` while streaming thousands of reasoning characters, and
+ * `output` matched `chars/4` for reasoning plus text plus tool input together
+ * (11003 reasoning characters, no text, `output` 2861). So the reasoning span
+ * is time during which the tokens being counted were produced, and removing
+ * it from the divisor counts that work twice: one session read 218 tok/s
+ * against the 74 its events support. A provider that reports reasoning
+ * separately already gets the right answer from `output + reasoning`.
  */
-const stepReasoningExclMs = (step: StepRecord): number => {
-  if (!step.settled || step.reasoning !== 0 || step.reasoningChars === 0) return 0;
-  if (step.firstReasoningAt === null || step.lastReasoningAt === null) return 0;
-  return Math.max(0, step.lastReasoningAt - step.firstReasoningAt);
-};
+const stepReasoningExclMs = (_step: StepRecord): number => 0;
 
 /**
  * No provider streams anywhere near this fast; a rate above it means the
@@ -747,6 +808,25 @@ const plausibleRate = (tokens: number, ms: number): number | null => {
 type StepContribution = { tokens: number; netMs: number; real: boolean; ttftMs: number | null };
 
 /**
+ * Where a step's divisor starts.
+ *
+ * Streamed deltas are timestamped, so output is divided by the time it was
+ * actually emitted in: time to first token is a latency, reported on its own
+ * as `ttft`, not something a throughput should divide by.
+ *
+ * Tokens the provider settled without ever streaming are the exception. A step
+ * that reports reasoning tokens but streamed no reasoning produced them during
+ * the silence before the first delta, and nothing else places them, so the
+ * divisor has to reach back to the step's real start or those tokens would
+ * carry no time at all.
+ */
+const generationStart = (step: StepRecord): number => {
+  if (step.firstCharAt === null) return step.startAt;
+  if (step.reasoning > 0 && !step.sawReasoning) return step.startAt;
+  return step.firstCharAt;
+};
+
+/**
  * One step's share of the turn average, or null when the step carries no
  * measurable signal: start never observed, net duration unmeasurable,
  * nothing countable settled, or an implausible rate from a truncated window.
@@ -757,9 +837,10 @@ const contributeStep = (step: StepRecord): StepContribution | null => {
   // (a model thinking with no deltas) extends no denominator, so the number
   // holds instead of sagging. Tool time past that point is excluded the same
   // way. Settled steps keep their settle timestamp, matching server timing.
+  const genStart = generationStart(step);
   const endRef = step.endAt ?? step.lastDeltaAt ?? step.startAt;
-  const netMs = Math.max(0, endRef - step.startAt)
-    - stepToolWithinMs(step, step.startAt, endRef)
+  const netMs = Math.max(0, endRef - genStart)
+    - stepToolWithinMs(step, genStart, endRef)
     - stepReasoningExclMs(step);
   if (!(netMs >= 1)) return null;
   let tokens: number;
@@ -910,7 +991,7 @@ const finalizeTurn = (now: number): void => {
 
 const pruneSamples = (now: number): void => {
   let expired = 0;
-  while (expired < samples.length && now - samples[expired].at > WINDOW_MS) {
+  while (expired < samples.length && now - samples[expired].at > CURVE_WINDOW_MS) {
     expired += 1;
   }
   if (expired > 0) samples.splice(0, expired);
@@ -949,11 +1030,7 @@ const recordChars = (messageID: string, partID: string, kind: Sample['kind'], ch
     step.chars += chars;
     step.lastDeltaAt = now;
     if (step.firstCharAt === null) step.firstCharAt = now;
-    if (kind === 'reasoning') {
-      step.reasoningChars += chars;
-      if (step.firstReasoningAt === null) step.firstReasoningAt = now;
-      step.lastReasoningAt = now;
-    }
+    if (kind === 'reasoning') step.sawReasoning = true;
   }
 };
 
@@ -1025,7 +1102,7 @@ const settleStep = (messageID: string, output: number, reasoning: number, now: n
   closeStepTool(step, now);
 };
 
-type RawEvent = { type?: unknown; data?: unknown; properties?: unknown };
+type RawEvent = { type?: unknown; data?: unknown; properties?: unknown; created?: unknown };
 
 /** Session an event belongs to: `sessionID` in `data` (2.x) / `properties` (1.x), or under `form`. */
 const eventSessionID = (event: RawEvent): string | null => {
@@ -1227,8 +1304,9 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
     const messageID = readString(payload.assistantMessageID);
     if (!messageID) return;
     // v2 names the model on the step; remember it so the correction is learned
-    // per model rather than per session.
-    const model = readString(payload.modelID) || readString(payload.model);
+    // per model rather than per session. `model` is an object here, so a plain
+    // string read returns '' and every model would share one wildcard entry.
+    const model = readString(payload.modelID) || readString(readRecord(payload.model)?.id);
     if (model) currentModel = model;
     const existing = steps.get(messageID);
     if (existing && (existing.settled || existing.endAt !== null)) {
@@ -1236,7 +1314,17 @@ const dispatchEvent = (event: RawEvent, now: number): void => {
       steps.delete(messageID);
       turnStepOrder = turnStepOrder.filter((id) => id !== messageID);
     }
-    stepFor(messageID, now).startObserved = true;
+    // The event is published once the step produces output, so it arrives one
+    // model-latency after `started` — 6.2 s on the session this was found in.
+    // Anchoring at arrival instead drops that latency from every measurement
+    // built on the step and reports the delivery interval as time to first
+    // token. `started` is rebased onto our own clock rather than used raw, so
+    // a service whose clock disagrees with the server's still measures the
+    // right *span*.
+    const serverCreated = readNumber(event.created) || now;
+    const started = readNumber(payload.started);
+    const startAt = started > 0 ? now - Math.max(0, serverCreated - started) : now;
+    stepFor(messageID, startAt).startObserved = true;
     lastEventAt = now;
     return;
   }
@@ -1497,7 +1585,7 @@ const parentListenEndpoints = async (): Promise<ListenEndpoint[]> => {
 const probeEventStream = async (origin: string, signal: AbortSignal): Promise<'stream' | 'refused' | null> => {
   try {
     const response = await fetch(new URL('/api/global/event', origin), {
-      headers: { Accept: 'text/event-stream' },
+      headers: { Accept: 'text/event-stream', ...serverHeaders() },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
     });
     const body = response.body;
@@ -1584,7 +1672,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       // only the server's default directory, which is why an open project would
       // never see its own session events there.
       response = await fetch(new URL('/api/global/event', origin), {
-        headers: { Accept: 'text/event-stream' },
+        headers: { Accept: 'text/event-stream', ...serverHeaders() },
         signal: local.signal,
       });
     } catch (error) {
@@ -1670,22 +1758,26 @@ const computeLive = (now: number): {
   toolChars: number;
 } => {
   pruneSamples(now);
-  if (samples.length === 0) {
-    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
-  }
-  // Divide by the span the samples actually cover, so the number is correct
-  // as soon as streaming starts instead of climbing while the window fills.
-  const spanMs = Math.max(1, Math.min(WINDOW_MS, now - samples[0].at));
+  const from = now - WINDOW_MS;
   let chars = 0;
   let textChars = 0;
   let reasoningChars = 0;
   let toolChars = 0;
+  let oldest = now;
   for (const sample of samples) {
+    if (sample.at < from) continue;
     chars += sample.chars;
     if (sample.kind === 'reasoning') reasoningChars += sample.chars;
     else if (sample.kind === 'tool') toolChars += sample.chars;
     else textChars += sample.chars;
+    if (sample.at < oldest) oldest = sample.at;
   }
+  if (chars === 0) {
+    return { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 };
+  }
+  // Divide by the span the samples actually cover, so the number is correct
+  // as soon as streaming starts instead of climbing while the window fills.
+  const spanMs = Math.max(1, Math.min(WINDOW_MS, now - oldest));
   return {
     // Not the headline, but a published field: a window whose samples all
     // landed in the same millisecond would otherwise report the same broken
@@ -1699,12 +1791,27 @@ const computeLive = (now: number): {
   };
 };
 
-/** Live curve: per-bucket rates over the window, oldest first. */
-const liveBuckets = (now: number): number[] => {
+/**
+ * The drawn curve, oldest first: one rate per bucket of the rolling window.
+ *
+ * Only live samples belong here. Finished-turn averages used to be prepended,
+ * but a point per turn and a point per bucket are different time bases, and
+ * sharing one normalized axis squashed whichever side was smaller — a history
+ * that peaked at 523 pushed a live 120 down to a quarter of the height, which
+ * read as the graph collapsing on the right.
+ *
+ * The length is always `CURVE_BUCKETS` and the buckets are fixed slices of the
+ * window, so the x-axis and the scale hold still between polls instead of
+ * rescaling whenever a bucket empties. Trailing silence is kept rather than
+ * trimmed: the line decays to the floor while the model thinks or a tool runs,
+ * which is what actually happened, rather than the tail being cut off to hide
+ * it. A window with nothing in it draws that floor rather than nothing at all,
+ * so the sparkline never disappears on a session that has gone quiet.
+ */
+const computeCurve = (now: number): number[] => {
   pruneSamples(now);
-  if (samples.length === 0) return [];
-  const width = WINDOW_MS / CURVE_BUCKETS;
-  const oldest = now - WINDOW_MS;
+  const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
+  const oldest = now - CURVE_WINDOW_MS;
   const out: number[] = [];
   for (let b = 0; b < CURVE_BUCKETS; b += 1) {
     const from = oldest + b * width;
@@ -1714,10 +1821,6 @@ const liveBuckets = (now: number): number[] => {
       if (sample.at < from || sample.at >= to) continue;
       chars += sample.chars;
     }
-    if (chars === 0) {
-      out.push(0);
-      continue;
-    }
     // A bucket is a fixed slice of the window, so its rate is what it holds
     // across its own width. Measuring the span the samples covered read a
     // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
@@ -1725,23 +1828,7 @@ const liveBuckets = (now: number): number[] => {
     // other point on the curve.
     out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
-  // Trim leading silence so a fresh turn starts drawing immediately.
-  let lead = 0;
-  while (lead < out.length && out[lead] <= 0) lead += 1;
-  return out.slice(lead);
-};
-
-/**
- * The drawn curve, oldest first: finished turns while idle, recent turns plus
- * the live window while streaming. Owned by the service so it survives iframe
- * remounts and session switches.
- */
-const computeCurve = (now: number): number[] => {
-  const past = turns.slice(-16).map((t) => t.tps);
-  if (!busy || waitingKind() !== null) return past;
-  const live = liveBuckets(now).filter((v) => v > 0);
-  if (live.length === 0) return past;
-  return [...past.slice(-8), ...live].slice(-(CURVE_BUCKETS * 2));
+  return out;
 };
 
 const isHttpOrigin = (value: string): boolean => {

@@ -173,7 +173,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   bigEl.className = Number.isFinite(shown) && shown > 0 ? 'big' : 'big muted';
 
   // The curve is owned by the service: it survives panel reloads and
-  // session switches. Just draw what it hands over.
+  // session switches, and is a rolling rate window rather than turn history.
   drawSpark(sparkParts, rate.curve, SPARK_W, SPARK_H);
 
   const lt = rate.lastTurn;

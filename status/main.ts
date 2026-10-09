@@ -34,7 +34,7 @@ type RateResponse = {
   live: Live;
   /** Running turn average; null when nothing has streamed yet this turn. */
   running: { tps: number; source: 'tokens' | 'estimate' } | null;
-  /** Drawn curve owned by the service: finished turns, plus the live window while streaming. */
+  /** Drawn curve owned by the service: one rate per bucket of the last 30 s. */
   curve: number[];
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
@@ -207,7 +207,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   valueEl.className = 'value';
 
   // The curve is owned by the service: it survives iframe remounts and
-  // session switches. Just draw what it hands over.
+  // session switches, and is a rolling rate window rather than turn history.
   drawSpark(sparkParts, rate.curve, SPARK_W, SPARK_H);
 
   // Second row: last-turn average + TTFT. Prefer the finished turn; while a

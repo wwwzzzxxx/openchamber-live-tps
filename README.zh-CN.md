@@ -15,7 +15,7 @@
 | `Live TPS` | 本轮进行中的平均速度；模型思考时冻结，工具执行时锁定 |
 | `last … (measured)` | 上一轮完成后的平均值——提供商上报了 token 数就是 `measured`，否则是 `estimated` |
 | `ttft` | 首字延迟 |
-| 曲线 | 最近几轮 |
+| 曲线 | 最近 30 秒的生成速率，每 1.25 秒一个点 |
 
 ## 依赖
 
@@ -85,6 +85,12 @@ OpenChamber server ─────────────▶ service/  （跑�
 两个界面都会自愈：service 重启后，它们发现 `/rate` 里 `sessionId: null` 就会重新 `/watch`，让 host 把 service 拉回来。
 
 service 还会自己探测父进程的回环端口去找 `/api/global/event`，所以 SSH 隧道连到远程 OpenChamber 也能测出真实速度，而不是 `unreachable`。
+
+### UI 密码下怎么读事件流
+
+SDK 刻意不让 service 继承 host 环境——「API key、UI 密码和其他 host 密钥永远不会到 service 手里」——所以 service 没有任何能带凭证访问 server API 的通道。用户没设 UI 密码时 `/api/global/event` 是开放的；一旦设了，所有 `/api/*` 都回 401，这个扩展就瞎了。
+
+所以 service 会从 `$OPENCHAMBER_DATA_DIR/settings.json`（默认 `~/.config/openchamber`）里读 `desktopLocalClientToken`，以 `Authorization: Bearer ...` 发出去——这正是 OpenChamber CLI 自己做本机 API 调用时的鉴权方式。它只是一个回环凭证，只对本机的 OpenChamber 有意义；无界面安装没有这个字段，而那种环境本来也不要求鉴权。也可以用 `OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` 显式指定。
 
 ## 已知边界
 

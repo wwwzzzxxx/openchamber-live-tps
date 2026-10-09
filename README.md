@@ -17,7 +17,7 @@ no tokenizer. See [Counting](#counting).
 | `Live TPS` | the running turn's average speed, frozen while the model thinks and locked while a tool runs |
 | `last … (measured)` | the finished turn's average — `measured` when the provider reported token counts, `estimated` otherwise |
 | `ttft` | time to first token |
-| Sparkline | recent turns |
+| Sparkline | the last 30 s of generation rate, one point per 1.25 s |
 
 ## Requirements
 
@@ -124,6 +124,22 @@ back.
 The service also discovers its own event-stream origin by probing the parent
 process's loopback ports for `/api/global/event`, so an SSH tunnel to a remote
 OpenChamber reports real numbers instead of `unreachable`.
+
+### Reading the event stream behind a UI password
+
+The SDK deliberately keeps host secrets out of a service's environment — "API
+keys, the UI password, and other host secrets never reach it" — so a service has
+no credentialed channel to the server API. `/api/global/event` is open until the
+user sets a UI password, after which every `/api/*` route answers 401 and this
+extension goes dark.
+
+The service therefore reads `desktopLocalClientToken` out of
+`$OPENCHAMBER_DATA_DIR/settings.json` (default `~/.config/openchamber`) and sends
+it as `Authorization: Bearer ...`, which is how the OpenChamber CLI authenticates
+its own desktop-local API calls. It is a loopback-only credential, meaningless to
+anything but an OpenChamber on this machine, and it is absent on a headless
+install — where the stream is unauthenticated anyway. Set
+`OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` to pass a token in explicitly instead.
 
 ## Limitations
 
