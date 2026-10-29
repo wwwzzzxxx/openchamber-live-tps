@@ -251,9 +251,10 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   const live = rate.live.tps;
   const streaming = rate.busy && rate.waiting === null && live > 0.05;
   const turnActive = rate.busy || rate.toolActive;
-  // Headline is the running turn average: stable across network jitter and
-  // identical to the finalized average when the turn ends.
-  const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
+  // Headline is the live rate, so the number and the sparkline read the same
+  // activity: both drop to zero when the model stops emitting (think, tool,
+  // or idle), instead of the number holding a stale turn average.
+  const shown = live;
   valueEl.textContent = Number.isFinite(shown) && shown > 0 ? formatTps(shown) : '—';
   valueEl.className = 'value';
 
