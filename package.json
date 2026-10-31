@@ -31,7 +31,7 @@
       "panel": {
         "id": "live-tps",
         "name": "Live TPS",
-        "icon": "speed-up-line",
+        "icon": "pulse",
         "entry": "panel/index.html"
       },
       "statusSection": {
