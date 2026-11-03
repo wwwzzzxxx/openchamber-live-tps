@@ -785,6 +785,52 @@ const afterDiscovery = await (await svcFetch('/rate')).json();
 check('events flow after discovery', afterDiscovery.busy === true, JSON.stringify({ busy: afterDiscovery.busy }));
 ev('session.execution.succeeded', { sessionID: SESSION });
 
+// --- origin discovery without ss/lsof ----------------------------------------
+// Minimal containers ship neither helper. An empty PATH forces the service
+// down the /proc path while the parent still owns the event-stream listener.
+if (process.platform === 'linux' && fs.existsSync('/proc/net/tcp') && fs.existsSync('/proc/self/fd')) {
+  const procPort = svcPort + 10;
+  const procSvc = spawn(process.execPath, ['service/main.js'], {
+    env: {
+      ...process.env,
+      PATH: '',
+      OPENCHAMBER_SERVICE_PORT: String(procPort),
+      OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
+      OPENCHAMBER_LIVE_TPS_STATE: `${STATE_FILE}.proc`,
+      OPENCHAMBER_DATA_DIR: path.join(os.tmpdir(), `live-tps-proc-${process.pid}`),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  procSvc.stderr.on('data', (d) => process.stderr.write(`[service-proc] ${d}`));
+  const procFetch = (p, init) => fetch(`http://127.0.0.1:${procPort}${p}`, {
+    ...init,
+    headers: { Authorization: `Bearer ${SERVICE_TOKEN}`, ...(init?.headers ?? {}) },
+  });
+  let procReady = false;
+  for (let i = 0; i < 50 && !procReady; i += 1) {
+    try { procReady = (await procFetch('/health')).ok; } catch { /* not up yet */ }
+    if (!procReady) await sleep(100);
+  }
+  check('service starts without ss/lsof on PATH', procReady);
+  if (procReady) {
+    await procFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: deadOrigin, sessionId: SESSION }) });
+    let procRate = null;
+    for (let i = 0; i < 30 && (!procRate || procRate.connection !== 'live'); i += 1) {
+      await sleep(100);
+      procRate = await (await procFetch('/rate')).json();
+    }
+    check(
+      'origin discovery falls back to /proc without ss/lsof',
+      procRate?.connection === 'live',
+      JSON.stringify(procRate && { connection: procRate.connection, error: procRate.error }),
+    );
+  }
+  procSvc.kill();
+  await once(procSvc, 'exit');
+  fs.rmSync(`${STATE_FILE}.proc`, { force: true });
+  fs.rmSync(path.join(os.tmpdir(), `live-tps-proc-${process.pid}`), { recursive: true, force: true });
+}
+
 // --- persistence: a restarted service still answers --------------------------
 // Closing OpenChamber kills this process. The numbers already measured are on
 // disk, so the panel shows the last turn straight away instead of sitting

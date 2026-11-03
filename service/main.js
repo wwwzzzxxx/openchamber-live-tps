@@ -1156,6 +1156,63 @@ var lsofListenEndpoints = async (pid) => {
   }
   return found;
 };
+var LITTLE_ENDIAN = os.endianness() === "LE";
+var procEndpoint = (value, ipv6) => {
+  const [address, portHex] = value.split(":");
+  if (!address || !portHex)
+    return null;
+  const port = Number.parseInt(portHex, 16);
+  if (!Number.isInteger(port) || port <= 0)
+    return null;
+  if (ipv6) {
+    const loopback = `${"0".repeat(24)}${LITTLE_ENDIAN ? "01000000" : "00000001"}`;
+    return address === loopback || address === "0".repeat(32) ? { host: "::1", port } : null;
+  }
+  if (address === "00000000")
+    return { host: "", port };
+  const bytes = address.match(/../g);
+  if (!bytes || bytes.length !== 4)
+    return null;
+  const ordered = LITTLE_ENDIAN ? [...bytes].reverse() : bytes;
+  const host = ordered.map((byte) => Number.parseInt(byte, 16)).join(".");
+  return { host, port };
+};
+var procListenEndpoints = async (pid) => {
+  const fdDir = `/proc/${pid}/fd`;
+  const inodes = new Set;
+  for (const entry of await fs2.promises.readdir(fdDir)) {
+    try {
+      const target = await fs2.promises.readlink(path2.join(fdDir, entry));
+      const match = /^socket:\[(\d+)\]$/.exec(target);
+      if (match)
+        inodes.add(match[1]);
+    } catch {}
+  }
+  if (inodes.size === 0)
+    return [];
+  const found = [];
+  for (const [file, ipv6] of [
+    ["/proc/net/tcp", false],
+    ["/proc/net/tcp6", true]
+  ]) {
+    let text;
+    try {
+      text = await fs2.promises.readFile(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split(`
+`).slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length < 10 || cols[3] !== "0A" || !inodes.has(cols[9]))
+        continue;
+      const endpoint = procEndpoint(cols[1], ipv6);
+      if (endpoint)
+        found.push(endpoint);
+    }
+  }
+  return found;
+};
 var parentListenEndpoints = async () => {
   const pid = process.ppid;
   if (!Number.isInteger(pid) || pid <= 1)
@@ -1168,10 +1225,17 @@ var parentListenEndpoints = async () => {
     }
   }
   try {
-    return await ssListenEndpoints(pid);
+    const found = await ssListenEndpoints(pid);
+    if (found.length > 0)
+      return found;
   } catch {}
   try {
-    return await lsofListenEndpoints(pid);
+    const found = await lsofListenEndpoints(pid);
+    if (found.length > 0)
+      return found;
+  } catch {}
+  try {
+    return await procListenEndpoints(pid);
   } catch {
     return [];
   }

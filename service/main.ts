@@ -1579,6 +1579,71 @@ const lsofListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
   return found;
 };
 
+/** `/proc/net/tcp{,6}` local address (`0100007F:A857`) -> loopback-safe endpoint. */
+const LITTLE_ENDIAN = os.endianness() === 'LE';
+
+const procEndpoint = (value: string, ipv6: boolean): ListenEndpoint | null => {
+  const [address, portHex] = value.split(':');
+  if (!address || !portHex) return null;
+  const port = Number.parseInt(portHex, 16);
+  if (!Number.isInteger(port) || port <= 0) return null;
+  if (ipv6) {
+    // Only the loopback listener matters here. `/proc` prints ::1 in host byte
+    // order, and a wildcard bind answers on ::1 too; any other IPv6 bind is
+    // left to `ss`/`lsof`.
+    const loopback = `${'0'.repeat(24)}${LITTLE_ENDIAN ? '01000000' : '00000001'}`;
+    return address === loopback || address === '0'.repeat(32) ? { host: '::1', port } : null;
+  }
+  if (address === '00000000') return { host: '', port };
+  const bytes = address.match(/../g);
+  if (!bytes || bytes.length !== 4) return null;
+  // The kernel prints the IPv4 address in host byte order; read it back.
+  const ordered = LITTLE_ENDIAN ? [...bytes].reverse() : bytes;
+  const host = ordered.map((byte) => Number.parseInt(byte, 16)).join('.');
+  return { host, port };
+};
+
+/**
+ * Linux without iproute2 (`ss`) or `lsof`, as in a minimal container. The
+ * parent's `/proc/<pid>/fd` names every socket it owns, and `/proc/net/tcp{,6}`
+ * maps those inodes to listening endpoints — the same answer `ss -ltnp` gives,
+ * read straight from the kernel.
+ */
+const procListenEndpoints = async (pid: number): Promise<ListenEndpoint[]> => {
+  const fdDir = `/proc/${pid}/fd`;
+  const inodes = new Set<string>();
+  for (const entry of await fs.promises.readdir(fdDir)) {
+    try {
+      const target = await fs.promises.readlink(path.join(fdDir, entry));
+      const match = /^socket:\[(\d+)\]$/.exec(target);
+      if (match) inodes.add(match[1]);
+    } catch {
+      // A descriptor closed while we scanned is simply not a listener.
+    }
+  }
+  if (inodes.size === 0) return [];
+  const found: ListenEndpoint[] = [];
+  for (const [file, ipv6] of [
+    ['/proc/net/tcp', false],
+    ['/proc/net/tcp6', true],
+  ] as const) {
+    let text: string;
+    try {
+      text = await fs.promises.readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n').slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      // State 0A is LISTEN, and column 9 is the socket inode.
+      if (cols.length < 10 || cols[3] !== '0A' || !inodes.has(cols[9])) continue;
+      const endpoint = procEndpoint(cols[1], ipv6);
+      if (endpoint) found.push(endpoint);
+    }
+  }
+  return found;
+};
+
 /**
  * Ports the parent process listens on. The parent *is* the OpenChamber server
  * that spawned this service, so its listeners are the only ones worth dialling:
@@ -1595,12 +1660,19 @@ const parentListenEndpoints = async (): Promise<ListenEndpoint[]> => {
     }
   }
   try {
-    return await ssListenEndpoints(pid);
+    const found = await ssListenEndpoints(pid);
+    if (found.length > 0) return found;
   } catch {
     // `ss` belongs to iproute2 and is absent on macOS, which ships `lsof`.
   }
   try {
-    return await lsofListenEndpoints(pid);
+    const found = await lsofListenEndpoints(pid);
+    if (found.length > 0) return found;
+  } catch {
+    // Neither helper is guaranteed on a minimal Linux host; /proc always is.
+  }
+  try {
+    return await procListenEndpoints(pid);
   } catch {
     return [];
   }
