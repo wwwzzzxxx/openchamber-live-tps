@@ -176,6 +176,38 @@ try {
   await until(async () => (await request('/rate')).connection === 'live');
   assert.equal(desktopLoginAttempts, 0);
   console.log('ok desktop local bearer authentication is tried before a password');
+
+  // The drawn curve follows the data, not the wall clock. While a chunk is
+  // fresh the edge tracks `now`; once the stream goes quiet it coasts one
+  // settle and parks, so an idle session has a curve that does not move.
+  await request('/watch', { origin: desktopHost.origin, sessionId: 'session-idle' });
+  emit('session.execution.started', { sessionID: 'session-idle' });
+  emit('session.text.delta', { sessionID: 'session-idle', assistantMessageID: 'idle', delta: 'z'.repeat(400) });
+  // One bucket has to complete before its rate is drawn: the bucket still
+  // filling is deliberately not part of the curve.
+  await delay(1_500);
+  const streamingRate = await request('/rate');
+  assert.ok(streamingRate.curve.some((value) => value > 0), 'a chunk lands in the curve');
+  assert.ok(
+    Math.abs(Date.now() - streamingRate.curveAt) < 1_500,
+    'while chunks arrive the edge tracks the live clock',
+  );
+  assert.ok(streamingRate.curveParkAt > streamingRate.curveAt, 'a streaming curve may still be projected forward');
+  assert.equal(typeof streamingRate.curveLastAt, 'number', 'the newest chunk is named to a page');
+  assert.ok(
+    Date.now() - streamingRate.curveLastAt < 3_000,
+    'the newest chunk is recent, so a page can time the hide from it',
+  );
+
+  await delay(5_000);
+  const parkedA = await request('/rate');
+  await delay(1_500);
+  const parkedB = await request('/rate');
+  assert.equal(parkedB.curveAt, parkedA.curveAt, 'an idle curve stays parked');
+  assert.deepEqual(parkedB.curve, parkedA.curve, 'an idle curve keeps the same points');
+  assert.ok(Date.now() - parkedA.curveAt > 1_000, 'the edge stops with the data, not with the clock');
+  assert.ok(parkedA.curveLastAt <= parkedA.curveAt, 'the newest chunk sits inside the parked window');
+  console.log('ok idle curve parks instead of sweeping');
 } finally {
   if (service && service.exitCode === null) {
     const exited = once(service, 'exit');
