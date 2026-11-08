@@ -110,6 +110,7 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
 var WINDOW_MS = 1000;
 var CURVE_WINDOW_MS = 30000;
 var CURVE_BUCKETS = 24;
+var CURVE_SETTLE_MS = 2000;
 var SAMPLE_LIMIT = 20000;
 var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
@@ -1111,9 +1112,9 @@ var parseEndpoint = (value) => {
     return { host: plain[1], port: Number(plain[2]) };
   return null;
 };
-var toOrigin = (scheme, host, port) => {
+var toOrigin = (scheme, host, port2) => {
   const dial = host === "" || host === "*" || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port}`;
+  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port2}`;
 };
 var runFile = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, {
@@ -1174,21 +1175,21 @@ var procEndpoint = (value, ipv6) => {
   const [address, portHex] = value.split(":");
   if (!address || !portHex)
     return null;
-  const port = Number.parseInt(portHex, 16);
-  if (!Number.isInteger(port) || port <= 0)
+  const port2 = Number.parseInt(portHex, 16);
+  if (!Number.isInteger(port2) || port2 <= 0)
     return null;
   if (ipv6) {
     const loopback = `${"0".repeat(24)}${LITTLE_ENDIAN ? "01000000" : "00000001"}`;
-    return address === loopback || address === "0".repeat(32) ? { host: "::1", port } : null;
+    return address === loopback || address === "0".repeat(32) ? { host: "::1", port: port2 } : null;
   }
   if (address === "00000000")
-    return { host: "", port };
+    return { host: "", port: port2 };
   const bytes = address.match(/../g);
   if (!bytes || bytes.length !== 4)
     return null;
   const ordered = LITTLE_ENDIAN ? [...bytes].reverse() : bytes;
   const host = ordered.map((byte) => Number.parseInt(byte, 16)).join(".");
-  return { host, port };
+  return { host, port: port2 };
 };
 var procListenEndpoints = async (pid) => {
   const fdDir = `/proc/${pid}/fd`;
@@ -1473,7 +1474,10 @@ var computeLive = (now) => {
 };
 var computeCurve = (now) => {
   const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
-  const newest = Math.floor(now / width) * width;
+  const lastAt = samples.length > 0 ? samples[samples.length - 1].at : null;
+  const parkAt = lastAt === null ? now : (Math.floor(lastAt / width) + 1) * width + CURVE_SETTLE_MS;
+  const edge = Math.min(now, parkAt);
+  const newest = Math.floor(edge / width) * width;
   const oldest = newest - CURVE_WINDOW_MS;
   pruneSamples(oldest);
   const buckets = new Array(CURVE_BUCKETS).fill(0);
@@ -1487,7 +1491,7 @@ var computeCurve = (now) => {
   for (let b = 0;b < CURVE_BUCKETS; b += 1) {
     values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
-  return { values, startAt: oldest, stepMs: width };
+  return { values, startAt: oldest, stepMs: width, at: edge, parkAt, lastAt };
 };
 var isHttpOrigin = (value) => {
   try {
@@ -1596,7 +1600,9 @@ var server = http.createServer((req, res) => {
         curve: curve.values,
         curveStart: curve.startAt,
         curveStep: curve.stepMs,
-        curveAt: now,
+        curveAt: curve.at,
+        curveParkAt: curve.parkAt,
+        curveLastAt: curve.lastAt,
         turn: {
           active: turnStartedAt !== null,
           ttftMs: liveTtftMs()
