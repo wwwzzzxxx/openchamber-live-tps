@@ -119,6 +119,14 @@ const WINDOW_MS = 1_000;
 const CURVE_WINDOW_MS = 30_000;
 /** Points on the drawn curve, one per bucket of `CURVE_WINDOW_MS`. */
 const CURVE_BUCKETS = 24;
+/**
+ * How far the window edge keeps moving after the last chunk, before the curve
+ * parks. Long enough that a pause reads as "it just stopped" — the trailing
+ * buckets still decay to the floor — short enough that a session nobody is
+ * using stops sweeping almost at once. Motion is a claim that data is arriving;
+ * a window that follows the wall clock makes that claim through silence.
+ */
+const CURVE_SETTLE_MS = 2_000;
 /** Hard cap on retained delta samples; half a minute of chunks fits far below this. */
 const SAMPLE_LIMIT = 20_000;
 const RETRY_BASE_MS = 1_000;
@@ -1979,14 +1987,29 @@ const computeLive = (now: number): {
  * Trailing silence is kept rather than trimmed: the line decays to the floor
  * while the model thinks or a tool runs, which is what actually happened,
  * rather than the tail being cut off to hide it. A window with nothing in it
- * draws that floor rather than nothing at all, so the sparkline never
- * disappears on a session that has gone quiet.
+ * draws that floor rather than nothing at all, so a curve the page still shows
+ * never blinks out from under a reader — the page hides it outright once the
+ * silence is long enough to mean the stream is over.
+ *
+ * The edge itself belongs to the data, not the wall clock: it may run at most
+ * `CURVE_SETTLE_MS` past the newest chunk and then stops. Anchored to `now`, an
+ * idle session kept translating its last profile left for the whole 30 s window
+ * — the curve appeared to be working while nothing had arrived for half a
+ * minute. `parkAt` is the edge the guest is allowed to project to; while chunks
+ * stream it sits ahead of `now`, so the pan is unchanged, and once they stop it
+ * clamps the sweep within one settle.
  */
-const computeCurve = (now: number): { values: number[]; startAt: number; stepMs: number } => {
+const computeCurve = (now: number): { values: number[]; startAt: number; stepMs: number; at: number; parkAt: number; lastAt: number | null } => {
   const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
-  // The newest edge at or before `now`: every drawn bucket is one that has
+  const lastAt = samples.length > 0 ? samples[samples.length - 1].at : null;
+  // The end of the bucket holding the newest sample, plus one settle: the
+  // furthest the window may travel before it has to stand still. A session with
+  // no samples at all has nothing to park against, so it keeps the live edge.
+  const parkAt = lastAt === null ? now : (Math.floor(lastAt / width) + 1) * width + CURVE_SETTLE_MS;
+  const edge = Math.min(now, parkAt);
+  // The newest edge at or before `edge`: every drawn bucket is one that has
   // already happened in full.
-  const newest = Math.floor(now / width) * width;
+  const newest = Math.floor(edge / width) * width;
   const oldest = newest - CURVE_WINDOW_MS;
   pruneSamples(oldest);
   const buckets = new Array<number>(CURVE_BUCKETS).fill(0);
@@ -2006,7 +2029,7 @@ const computeCurve = (now: number): { values: number[]; startAt: number; stepMs:
     // other point on the curve.
     values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
-  return { values, startAt: oldest, stepMs: width };
+  return { values, startAt: oldest, stepMs: width, at: edge, parkAt, lastAt };
 };
 
 const isHttpOrigin = (value: string): boolean => {
@@ -2152,11 +2175,18 @@ const server = http.createServer((req, res) => {
         running: turnStartedAt !== null ? computeRunning() : null,
         // The buckets' own clock travels with them: without it a guest can
         // only place them on an index axis, which is what made the curve
-        // deform instead of slide. `curveAt` is the window's right edge.
+        // deform instead of slide. `curveAt` is the window's right edge; it
+        // stops following the wall clock once the data does, and `curveParkAt`
+        // is the furthest a guest may project it between polls.
         curve: curve.values,
         curveStart: curve.startAt,
         curveStep: curve.stepMs,
-        curveAt: now,
+        curveAt: curve.at,
+        curveParkAt: curve.parkAt,
+        // Epoch ms of the newest chunk, or null: a page hides the curve once
+        // this is older than a few seconds, rather than leaving a frozen
+        // profile on screen that reads as if it were still moving.
+        curveLastAt: curve.lastAt,
         turn: {
           active: turnStartedAt !== null,
           ttftMs: liveTtftMs(),
