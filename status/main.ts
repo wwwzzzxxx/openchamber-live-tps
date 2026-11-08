@@ -42,6 +42,10 @@ type RateResponse = {
   curveStep?: number;
   /** Epoch ms the curve was computed at; absent from an older service. */
   curveAt?: number;
+  /** Furthest epoch ms the edge may be projected to; absent from an older service. */
+  curveParkAt?: number;
+  /** Epoch ms of the newest chunk; null before the first one. */
+  curveLastAt?: number | null;
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
   eventsSeen: number;
@@ -92,6 +96,13 @@ const SPARK_W = 120;
 const SPARK_H = 18;
 /** Narrowest believable fallback window for a service that predates the timestamps. */
 const SPARK_WINDOW_MS = 30_000;
+/**
+ * Silence after which the curve is not shown at all. It describes a stream;
+ * with nothing streaming there is no shape to read, and a frozen profile left
+ * on screen reads as if it were still working. Wider than a normal gap between
+ * chunks, short enough that a finished turn clears at once.
+ */
+const SPARK_HIDE_MS = 4_000;
 /** Floor between watch re-asserts, so a service that is down costs one call a second, not one per poll. */
 const REASSERT_MIN_MS = 1_000;
 
@@ -114,6 +125,11 @@ let sparkFrame: SparkFrame | null = null;
 let sparkFrameAt = 0;
 let sparkScale = 1;
 let sparkPaintedAt = 0;
+/** Edge the last path was drawn against; equal again means nothing to redraw. */
+let sparkDrawn = Number.NaN;
+/** Epoch ms of the newest chunk, and whether the curve is currently hidden. */
+let sparkLastAt = Number.NaN;
+let sparkIdle = false;
 
 const row1 = document.createElement('div');
 row1.className = 'row';
@@ -167,12 +183,17 @@ const sparkFrameFrom = (rate: RateResponse): SparkFrame => {
   const step = rate.curveStep && rate.curveStep > 0 ? rate.curveStep : SPARK_WINDOW_MS / Math.max(1, rate.curve.length);
   const at = rate.curveAt ?? Date.now();
   const startAt = rate.curveStart ?? at - rate.curve.length * step;
-  return { values: rate.curve, startAt, stepMs: step, at };
+  // A service that predates `curveParkAt` gets an unbounded edge, which draws
+  // exactly what it used to; one that sends it stops the sweep with the data.
+  const parkAt = rate.curveParkAt ?? Number.POSITIVE_INFINITY;
+  return { values: rate.curve, startAt, stepMs: step, at, parkAt };
 };
 
 const dropSpark = (): void => {
   sparkFrame = null;
   sparkScale = 1;
+  sparkDrawn = Number.NaN;
+  sparkLastAt = Number.NaN;
   clearSparkPaths(sparkParts);
 };
 
@@ -180,18 +201,38 @@ const dropSpark = (): void => {
  * Redraw between polls against a projected clock, so the curve slides instead
  * of stepping two pixels at a time four times a second. The point values stay
  * exactly what the service measured; only the window edge moves.
+ *
+ * The projection stops at `parkAt`, where the data stopped, and the whole
+ * curve fades out `SPARK_HIDE_MS` after the newest chunk. What is left on
+ * screen is either moving or gone, so motion always means tokens.
  */
 const paintSpark = (): void => {
   if (stopped) return;
   const frame = sparkFrame;
   const at = performance.now();
+  // Date.now() pairs with the service's own epoch stamps, unlike the
+  // performance clock used for the projection.
+  const idle = !(Date.now() - sparkLastAt <= SPARK_HIDE_MS);
+  if (idle !== sparkIdle) {
+    sparkIdle = idle;
+    sparkEl.classList.toggle('is-idle', idle);
+    // Coming back needs a draw even if the edge happens to match the last one.
+    sparkDrawn = Number.NaN;
+  }
   // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
   // repainting the whole section sixty times a second on an idle session.
-  if (frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
-    sparkPaintedAt = at;
-    const elapsed = Math.min(2_000, at - sparkFrameAt);
-    sparkScale = nextScale(sparkScale, frame.values);
-    drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+  if (!idle && frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
+    const drawn = Math.min(frame.at + Math.min(2_000, at - sparkFrameAt), frame.parkAt);
+    if (drawn !== sparkDrawn) {
+      sparkPaintedAt = at;
+      sparkDrawn = drawn;
+      // Parked means the shape will not be drawn again: jump the scale to its
+      // target instead of easing, which would keep the frozen curve growing.
+      sparkScale = drawn >= frame.parkAt
+        ? Math.max(1, ...frame.values)
+        : nextScale(sparkScale, frame.values);
+      drawSpark(sparkParts, frame, drawn, SPARK_W, SPARK_H, sparkScale);
+    }
   }
   requestAnimationFrame(paintSpark);
 };
@@ -264,6 +305,9 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // rather than the previous session's shape being left on screen.
   sparkFrame = sparkFrameFrom(rate);
   sparkFrameAt = performance.now();
+  sparkLastAt = rate.curveLastAt ?? Number.NaN;
+  // A new answer can carry new point values at the same edge; redraw it.
+  sparkDrawn = Number.NaN;
   if (sparkFrame.values.length === 0) dropSpark();
 
   // Second row: last-turn average + TTFT. Prefer the finished turn; while a
@@ -309,6 +353,7 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
   live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 },
   running: null,
   curve: [],
+  curveLastAt: null,
   turn: { active: false, ttftMs: null },
   lastTurn: null,
 });

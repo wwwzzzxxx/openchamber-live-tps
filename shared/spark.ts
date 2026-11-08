@@ -23,6 +23,13 @@ export type SparkFrame = {
   stepMs: number;
   /** Epoch ms the frame was computed at; the window's right edge. */
   at: number;
+  /**
+   * Epoch ms the edge may be projected to and no further — where the data
+   * stopped. Without it a guest inching the edge forward with the wall clock
+   * keeps the curve sweeping through a silence it no longer describes;
+   * `Infinity` keeps an older service drawing exactly as it did.
+   */
+  parkAt: number;
 };
 
 const EMPTY = { line: '', area: '' };

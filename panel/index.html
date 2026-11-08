@@ -26,7 +26,11 @@
   .big.muted { color: var(--oc-muted, #888); font-size: 20px; font-weight: 500; }
   .big.stale { color: var(--oc-muted, #888); }
   .unit { color: var(--oc-muted, #888); }
-  .spark { margin: 4px 0; color: var(--oc-primary, #888); display: flex; }
+  .spark { margin: 4px 0; color: var(--oc-primary, #888); display: flex; transition: opacity 350ms ease; }
+  /* No chunks for a few seconds: the curve describes a stream that is not
+     running, so it goes away rather than freezing in place. The box stays, so
+     the panel does not reflow when it comes back. */
+  .spark.is-idle { opacity: 0; }
   .spark-line { stroke: currentColor; }
   .spark-area { fill: currentColor; opacity: 0.18; }
   .muted { color: var(--oc-muted, #888); }
