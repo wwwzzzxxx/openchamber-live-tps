@@ -1,6 +1,7 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
-import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
+import { createSparkAnimator, makeSparkSvg, type SparkFrame } from '../shared/spark';
+import { createRefreshLoop, createView } from '../shared/refresh';
 
 type Live = {
   tps: number;
@@ -130,6 +131,7 @@ const SPARK_WINDOW_MS = 30_000;
 const REASSERT_MIN_MS = 1_000;
 
 const host = connectHost();
+const view = createView();
 const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
@@ -137,25 +139,9 @@ let copy: Copy = COPY.zh;
 let origin: string | null = null;
 let session: HostSession = null;
 let mounted = false;
-let polling = false;
-let stopped = false;
 let configuredKey = '';
 let configuring = false;
 let lastReassertAt = 0;
-let heightReported = false;
-/** Latest curve from the service, when this page received it, and its full scale. */
-let sparkFrame: SparkFrame | null = null;
-let sparkFrameAt = 0;
-let sparkScale = 1;
-let sparkPaintedAt = 0;
-/**
- * Whether the curve still holds a nonzero point. It slides as long as it does,
- * even after the turn ended and the live number is already zero — a decaying
- * tail is still moving data. Only a curve that is zero everywhere stops.
- */
-let sparkMoving = false;
-/** A curve that just emptied still needs one static draw to flatten out. */
-let sparkNeedsStatic = false;
 
 const row1 = document.createElement('div');
 row1.className = 'row';
@@ -169,6 +155,7 @@ unitEl.className = 'unit';
 const sparkEl = document.createElement('div');
 sparkEl.className = 'row sparkrow';
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
+const spark = createSparkAnimator(sparkParts, SPARK_W, SPARK_H);
 // Same treatment as the panel: the drawing keeps its coordinate system and the
 // element spans the section, so the curve reaches both edges.
 sparkParts.svg.setAttribute('width', '100%');
@@ -251,42 +238,12 @@ const sparkFrameFrom = (rate: RateResponse): SparkFrame => {
 };
 
 const dropSpark = (): void => {
-  sparkFrame = null;
-  sparkScale = 1;
-  clearSparkPaths(sparkParts);
+  spark.update(null);
 };
 
-/**
- * Redraw between polls against a projected clock, so the curve slides instead
- * of stepping two pixels at a time four times a second. The point values stay
- * exactly what the service measured; only the window edge moves.
- */
-const paintSpark = (): void => {
-  if (stopped) return;
-  const frame = sparkFrame;
-  const at = performance.now();
-  if (frame && frame.values.length > 0) {
-    if (sparkMoving) {
-      // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
-      // repainting the whole section sixty times a second.
-      if (at - sparkPaintedAt >= 30) {
-        sparkPaintedAt = at;
-        const elapsed = Math.min(2_000, at - sparkFrameAt);
-        sparkScale = nextScale(sparkScale, frame.values);
-        drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
-      }
-    } else if (sparkNeedsStatic) {
-      // Snap to the frame's own edge so the frozen picture does not keep the
-      // projection of a slide that has stopped.
-      sparkNeedsStatic = false;
-      sparkScale = nextScale(sparkScale, frame.values);
-      drawSpark(sparkParts, frame, frame.at, SPARK_W, SPARK_H, sparkScale);
-    }
-  }
-  requestAnimationFrame(paintSpark);
-};
-
-const fitHeight = (): void => {
+const fitHeight = (force = false): void => {
+  const changed = view.takeChanges();
+  if (!force && !changed) return;
   const h = Math.min(320, Math.max(24, Math.ceil(root.scrollHeight) + 2));
   if (h !== lastHeight) {
     lastHeight = h;
@@ -296,8 +253,8 @@ const fitHeight = (): void => {
 
 const setState = (text: string): void => {
   // An empty state must not leave a flex gap behind in the meta row.
-  stateEl.textContent = text;
-  stateEl.hidden = text.length === 0;
+  view.text(stateEl, text);
+  view.hidden(stateEl, text.length === 0);
 };
 
 const formatPct = (value: number | null | undefined): string => (
@@ -315,70 +272,71 @@ const barWidth = (value: number | null | undefined): string => (
  */
 const paintCache = (info: CacheInfo | null | undefined): void => {
   const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
-  stepCache.root.hidden = !present;
-  totalCache.root.hidden = !present;
+  view.hidden(stepCache.root, !present);
+  view.hidden(totalCache.root, !present);
   if (!present || !info) {
-    stepCache.pct.textContent = '—';
-    totalCache.pct.textContent = '—';
-    stepCache.delta.textContent = '';
-    stepCache.bar.hidden = true;
-    totalCache.bar.hidden = true;
+    view.text(stepCache.pct, '—');
+    view.text(totalCache.pct, '—');
+    view.text(stepCache.delta, '');
+    view.hidden(stepCache.bar, true);
+    view.hidden(totalCache.bar, true);
     return;
   }
-  stepCache.label.textContent = copy.stepHit;
-  totalCache.label.textContent = copy.totalHit;
-  stepCache.bar.hidden = false;
-  totalCache.bar.hidden = false;
+  view.text(stepCache.label, copy.stepHit);
+  view.text(totalCache.label, copy.totalHit);
+  view.hidden(stepCache.bar, false);
+  view.hidden(totalCache.bar, false);
   const last = info.last;
-  stepCache.fill.style.width = barWidth(last?.hitRate);
-  stepCache.pct.textContent = formatPct(last?.hitRate);
+  view.width(stepCache.fill, barWidth(last?.hitRate));
+  view.text(stepCache.pct, formatPct(last?.hitRate));
   const delta = last?.delta;
   if (typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05) {
-    stepCache.delta.textContent = `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`;
-    stepCache.delta.className = delta >= 0 ? 'cache-delta up' : 'cache-delta down';
+    view.text(stepCache.delta, `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`);
+    view.className(stepCache.delta, delta >= 0 ? 'cache-delta up' : 'cache-delta down');
   } else {
-    stepCache.delta.textContent = '';
-    stepCache.delta.className = 'cache-delta';
+    view.text(stepCache.delta, '');
+    view.className(stepCache.delta, 'cache-delta');
   }
-  totalCache.fill.style.width = barWidth(info.hitRate);
-  totalCache.pct.textContent = formatPct(info.hitRate);
-  totalCache.delta.textContent = '';
+  view.width(totalCache.fill, barWidth(info.hitRate));
+  view.text(totalCache.pct, formatPct(info.hitRate));
+  view.text(totalCache.delta, '');
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
-    dot.className = 'dot';
-    valueEl.textContent = '—';
+    refresh.setActive(false);
+    view.className(dot, 'dot');
+    view.text(valueEl, '—');
     setState(notice ?? copy.connecting);
-    lastEl.textContent = '';
+    view.text(lastEl, '');
     paintCache(null);
     dropSpark();
     fitHeight();
     return;
   }
   if (rate.connection === 'error') {
-    dot.className = 'dot wait';
+    view.className(dot, 'dot wait');
     // A network failure is a wrong address, not a bad response: name the
     // condition rather than leak the runtime's `fetch failed`.
     setState(
       rate.errorKind === 'network' ? copy.unreachable : (rate.error ?? copy.reconnecting),
     );
   } else if (rate.connection !== 'live') {
-    dot.className = 'dot';
+    view.className(dot, 'dot');
     setState(copy.connecting);
   } else if (rate.waiting === 'permission') {
-    dot.className = 'dot wait';
+    view.className(dot, 'dot wait');
     setState(copy.waitingPermission);
   } else if (rate.waiting === 'question') {
-    dot.className = 'dot wait';
+    view.className(dot, 'dot wait');
     setState(copy.waitingQuestion);
   } else if (rate.toolActive) {
-    dot.className = 'dot live';
+    view.className(dot, 'dot live');
     setState(copy.toolRunning);
   } else {
     // "generating" and "idle" say nothing the dot and the headline do not
     // already say — they only stretched the meta line.
-    dot.className = rate.busy ? 'dot live' : 'dot';
+    view.className(dot, rate.busy ? 'dot live' : 'dot');
     setState('');
   }
 
@@ -389,28 +347,17 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // identical to the finalized average when the turn ends.
   const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
   const hasValue = Number.isFinite(shown) && shown > 0;
-  valueEl.textContent = hasValue ? formatTps(shown) : '—';
+  view.text(valueEl, hasValue ? formatTps(shown) : '—');
   // Grey whenever tokens are not arriving, so the number does not read as a
   // live rate next to a curve that has already decayed towards zero.
-  valueEl.className = hasValue && !streaming ? 'value stale' : 'value';
+  view.className(valueEl, hasValue && !streaming ? 'value stale' : 'value');
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
   // An empty curve means the answer belongs to no session, so nothing is drawn
   // rather than the previous session's shape being left on screen.
-  const nextFrame = sparkFrameFrom(rate);
-  const moving = nextFrame.values.some((value) => value > 0.05);
-  if (nextFrame.values.length === 0) {
-    dropSpark();
-    sparkMoving = false;
-  } else {
-    sparkFrame = nextFrame;
-    sparkFrameAt = performance.now();
-    // A nonzero curve keeps panning at any time; all zeros flatten once and
-    // then hold, so a quiet session shows no motion at all.
-    sparkNeedsStatic = sparkMoving && !moving;
-    sparkMoving = moving;
-  }
+  spark.update(sparkFrameFrom(rate));
+  refresh.setActive(rate.busy || rate.toolActive || spark.moving);
 
   // Second row: last-turn average + TTFT. Prefer the finished turn; while a
   // turn runs, show its TTFT so far.
@@ -426,7 +373,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   if (lt && !lt.hasReasoning && lt.tokens > 0) {
     parts.push(copy.noReasoning);
   }
-  lastEl.textContent = parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData);
+  view.text(lastEl, parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData));
 
   paintCache(rate.cache);
 
@@ -463,18 +410,18 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
 });
 
 const poll = async (): Promise<void> => {
-  if (stopped || polling) return;
   // No origin is not a dead end: a relay client runs this page as a `srcDoc`,
   // where `window.location` is `about:srcdoc`. The service finds the server on
   // the machine that hosts it, so the page still asks and shows what it gets.
-  polling = true;
+  const requestedSession = session?.id ?? null;
   try {
     // Name the session so a page and a service holding different sessions
     // each read their own record instead of whichever one watched last.
     const result = await host.serviceRequest({
       method: 'GET',
-      path: session?.id ? `/rate?sessionId=${encodeURIComponent(session.id)}` : '/rate',
+      path: requestedSession ? `/rate?sessionId=${encodeURIComponent(requestedSession)}` : '/rate',
     });
+    if (!refresh.visible || requestedSession !== (session?.id ?? null)) return;
     if (result.status < 400) {
       const rate = JSON.parse(result.body) as RateResponse;
       // A page with no session must never show another session's numbers:
@@ -498,9 +445,7 @@ const poll = async (): Promise<void> => {
       render(null, `HTTP ${result.status}`);
     }
   } catch (error) {
-    render(null, describeError(error));
-  } finally {
-    polling = false;
+    if (refresh.visible && requestedSession === (session?.id ?? null)) render(null, describeError(error));
   }
 };
 
@@ -523,26 +468,18 @@ const configure = async (sessionId: string | null): Promise<void> => {
   }
 };
 
+const refresh = createRefreshLoop(root, poll, (visible) => {
+  spark.setVisible(visible);
+  dot.style.animationPlayState = visible ? 'running' : 'paused';
+});
+
 const mount = (): void => {
   root.append(row1, sparkEl, row2, stepCache.root, totalCache.root);
-  unitEl.textContent = copy.unit;
-  if (!heightReported) {
-    heightReported = true;
-    // Real height follows content via fitHeight() on every render.
-    fitHeight();
-  }
-  stopped = false;
+  view.text(unitEl, copy.unit);
+  fitHeight(true);
+  window.addEventListener('resize', () => fitHeight(true));
   void configure(session?.id ?? null);
-  void poll();
-  requestAnimationFrame(paintSpark);
-  const loop = () => {
-    if (stopped) return;
-    window.setTimeout(async () => {
-      await poll();
-      loop();
-    }, document.hidden ? 1000 : 250);
-  };
-  loop();
+  refresh.start();
 };
 
 host.onReady((next) => {
@@ -550,16 +487,22 @@ host.onReady((next) => {
   applyHostReady(next, document.documentElement);
   session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy } : null;
   origin = resolveOrigin();
-  unitEl.textContent = copy.unit;
+  view.text(unitEl, copy.unit);
   if (!mounted) {
     mounted = true;
     mount();
     return;
   }
   void configure(session?.id ?? null);
+  fitHeight(true);
+  refresh.wake();
 });
 
 host.onSession((next) => {
+  const changed = (session?.id ?? null) !== (next?.id ?? null);
   session = next ? { id: next.id, title: next.title, busy: next.busy } : null;
   void configure(session?.id ?? null);
+  if (changed) refresh.wake();
 });
+
+host.onSessionLifecycle(() => refresh.wake());

@@ -1,6 +1,7 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
-import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
+import { createSparkAnimator, makeSparkSvg, type SparkFrame } from '../shared/spark';
+import { createRefreshLoop, createView } from '../shared/refresh';
 
 const SPARK_W = 248;
 const SPARK_H = 36;
@@ -128,6 +129,7 @@ const COPY = {
 type Copy = Record<keyof (typeof COPY)['zh'], string>;
 
 const host = connectHost();
+const view = createView();
 const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
@@ -135,21 +137,7 @@ let copy: Copy = COPY.zh;
 let origin: string | null = null;
 let sessionId: string | null = null;
 let mounted = false;
-let polling = false;
-let stopped = false;
 let configuredKey = '';
-/** Latest curve from the service, when this page received it, and its full scale. */
-let sparkFrame: SparkFrame | null = null;
-let sparkFrameAt = 0;
-let sparkScale = 1;
-let sparkPaintedAt = 0;
-/**
- * Whether the curve still holds a nonzero point. A decaying tail keeps sliding
- * (it is still moving data); only a curve that is zero everywhere stops.
- */
-let sparkMoving = false;
-/** A curve that just emptied still needs one static draw to flatten out. */
-let sparkNeedsStatic = false;
 const titleEl = document.createElement('h1');
 const stateLine = document.createElement('div');
 const dot = document.createElement('span');
@@ -164,6 +152,7 @@ unitLine.className = 'unit muted';
 const sparkEl = document.createElement('div');
 sparkEl.className = 'spark';
 const sparkParts = makeSparkSvg(SPARK_W, SPARK_H);
+const spark = createSparkAnimator(sparkParts, SPARK_W, SPARK_H);
 // The drawing keeps its 248-unit coordinate system; the element spans the
 // panel and stretches the curve horizontally, so its width never needs
 // measuring (or a resize observer) on a page that redraws every frame.
@@ -253,38 +242,6 @@ const sparkFrameFrom = (rate: RateResponse): SparkFrame => {
   return { values: rate.curve, startAt, stepMs: step, at };
 };
 
-/**
- * Redraw between polls against a projected clock.
- *
- * The service answers every 250 ms, which is a fifth of a bucket: at one point
- * per poll the curve would jump two pixels at a time. Sliding the window edge
- * with the wall clock turns those jumps into a continuous pan, while the point
- * values stay exactly what the service measured.
- */
-const paintSpark = (): void => {
-  if (stopped) return;
-  const frame = sparkFrame;
-  const at = performance.now();
-  // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
-  // repainting the whole panel sixty times a second on an idle session.
-  if (frame && frame.values.length > 0) {
-    if (sparkMoving) {
-      if (at - sparkPaintedAt >= 30) {
-        sparkPaintedAt = at;
-        const elapsed = Math.min(2_000, at - sparkFrameAt);
-        sparkScale = nextScale(sparkScale, frame.values);
-        drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
-      }
-    } else if (sparkNeedsStatic) {
-      // Drop the frozen slide's projection and draw the frame where it ended.
-      sparkNeedsStatic = false;
-      sparkScale = nextScale(sparkScale, frame.values);
-      drawSpark(sparkParts, frame, frame.at, SPARK_W, SPARK_H, sparkScale);
-    }
-  }
-  requestAnimationFrame(paintSpark);
-};
-
 const formatPct = (value: number | null | undefined): string => (
   typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '—'
 );
@@ -303,64 +260,66 @@ const formatTokens = (value: number): string => {
 const paintCache = (info: CacheInfo | null | undefined): void => {
   const hasSteps = !!info && info.steps > 0;
   const hasRate = hasSteps && info !== null && info !== undefined && info.hit + info.miss > 0;
-  cacheBlock.hidden = !hasRate;
-  stepLine.label.textContent = copy.stepHit;
-  totalLine.label.textContent = copy.totalHit;
-  stepLine.pct.textContent = hasRate && info ? formatPct(info.last?.hitRate) : '—';
-  totalLine.pct.textContent = hasRate && info ? formatPct(info.hitRate) : '—';
-  stepLine.fill.style.width = hasRate ? barWidth(info?.last?.hitRate) : '0%';
-  totalLine.fill.style.width = hasRate ? barWidth(info?.hitRate) : '0%';
+  view.hidden(cacheBlock, !hasRate);
+  view.text(stepLine.label, copy.stepHit);
+  view.text(totalLine.label, copy.totalHit);
+  view.text(stepLine.pct, hasRate && info ? formatPct(info.last?.hitRate) : '—');
+  view.text(totalLine.pct, hasRate && info ? formatPct(info.hitRate) : '—');
+  view.width(stepLine.fill, hasRate ? barWidth(info?.last?.hitRate) : '0%');
+  view.width(totalLine.fill, hasRate ? barWidth(info?.hitRate) : '0%');
   const delta = hasRate ? info?.last?.delta : null;
   if (typeof delta === 'number' && Number.isFinite(delta) && Math.abs(delta) >= 0.05) {
-    stepLine.delta.textContent = `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`;
-    stepLine.delta.className = delta >= 0 ? 'delta up' : 'delta down';
+    view.text(stepLine.delta, `${delta >= 0 ? '↑' : '↓'}${Math.abs(delta).toFixed(1)}`);
+    view.className(stepLine.delta, delta >= 0 ? 'delta up' : 'delta down');
   } else {
-    stepLine.delta.textContent = '';
-    stepLine.delta.className = 'delta';
+    view.text(stepLine.delta, '');
+    view.className(stepLine.delta, 'delta');
   }
   if (!hasSteps || !info) {
-    hitMissEl.textContent = '—';
-    outputEl.textContent = '—';
-    stepsEl.textContent = '—';
-    costEl.textContent = '—';
+    view.text(hitMissEl, '—');
+    view.text(outputEl, '—');
+    view.text(stepsEl, '—');
+    view.text(costEl, '—');
     return;
   }
-  hitMissEl.textContent = `${formatTokens(info.hit)} / ${formatTokens(info.miss)}`;
-  outputEl.textContent = `${formatTokens(info.output)} tok`;
-  stepsEl.textContent = info.sessions > 1
+  view.text(hitMissEl, `${formatTokens(info.hit)} / ${formatTokens(info.miss)}`);
+  view.text(outputEl, `${formatTokens(info.output)} tok`);
+  view.text(stepsEl, info.sessions > 1
     ? `${info.steps} · ${copy.subs} ${info.sessions - 1}`
-    : String(info.steps);
-  costEl.textContent = info.cost > 0 ? `$${Number(info.cost.toFixed(4))}` : '—';
+    : String(info.steps));
+  view.text(costEl, info.cost > 0 ? `$${Number(info.cost.toFixed(4))}` : '—');
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
-    dot.className = 'dot';
-    stateText.textContent = notice ?? copy.connecting;
+    refresh.setActive(false);
+    spark.update(null);
+    view.className(dot, 'dot');
+    view.text(stateText, notice ?? copy.connecting);
     paintCache(null);
     return;
   }
   if (rate.connection === 'error') {
-    dot.className = 'dot wait';
-    stateText.textContent = rate.error ?? copy.reconnecting;
+    view.className(dot, 'dot wait');
+    view.text(stateText, rate.error ?? copy.reconnecting);
   } else if (rate.connection !== 'live') {
-    dot.className = 'dot';
-    stateText.textContent = copy.connecting;
+    view.className(dot, 'dot');
+    view.text(stateText, copy.connecting);
   } else if (rate.waiting === 'permission') {
-    dot.className = 'dot wait';
-    stateText.textContent = copy.waitingPermission;
+    view.className(dot, 'dot wait');
+    view.text(stateText, copy.waitingPermission);
   } else if (rate.waiting === 'question') {
-    dot.className = 'dot wait';
-    stateText.textContent = copy.waitingQuestion;
+    view.className(dot, 'dot wait');
+    view.text(stateText, copy.waitingQuestion);
   } else if (rate.toolActive) {
-    dot.className = 'dot live';
-    stateText.textContent = copy.toolRunning;
+    view.className(dot, 'dot live');
+    view.text(stateText, copy.toolRunning);
   } else if (rate.busy) {
-    dot.className = 'dot live';
-    stateText.textContent = copy.generating;
+    view.className(dot, 'dot live');
+    view.text(stateText, copy.generating);
   } else {
-    dot.className = 'dot';
-    stateText.textContent = copy.idle;
+    view.className(dot, 'dot');
+    view.text(stateText, copy.idle);
   }
 
   const live = rate.live.tps;
@@ -373,52 +332,40 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   // identical to the finalized average when the turn ends.
   const shown = rate.running ? rate.running.tps : (rate.lastTurn?.tokensPerSecond ?? NaN);
   const hasValue = Number.isFinite(shown) && shown > 0;
-  bigEl.textContent = hasValue ? formatTps(shown) : '—';
+  view.text(bigEl, hasValue ? formatTps(shown) : '—');
   // Grey whenever tokens are not arriving. The number stays the running or
   // last average, but full strength made it read as a live rate while the
   // curve was already decaying: thinking, a tool run, or a finished turn.
-  bigEl.className = hasValue ? (streaming ? 'big' : 'big stale') : 'big muted';
+  view.className(bigEl, hasValue ? (streaming ? 'big' : 'big stale') : 'big muted');
 
   // The curve is owned by the service: it survives panel reloads and
   // session switches, and is a rolling rate window rather than turn history.
   // An empty curve means the answer belongs to no session, so nothing is drawn
   // rather than the previous session's shape being left on screen.
-  const nextFrame = sparkFrameFrom(rate);
-  const moving = nextFrame.values.some((value) => value > 0.05);
-  if (nextFrame.values.length === 0) {
-    sparkFrame = null;
-    sparkMoving = false;
-    clearSparkPaths(sparkParts);
-  } else {
-    sparkFrame = nextFrame;
-    sparkFrameAt = performance.now();
-    // A nonzero curve keeps panning even after the turn ends; a curve that is
-    // zero everywhere is drawn once and then held still.
-    sparkNeedsStatic = sparkMoving && !moving;
-    sparkMoving = moving;
-  }
+  spark.update(sparkFrameFrom(rate));
+  refresh.setActive(rate.busy || rate.toolActive || spark.moving);
 
   const lt = rate.lastTurn;
-  lastEl.textContent = lt
+  view.text(lastEl, lt
     ? `${formatTps(lt.tokensPerSecond)} ${copy.unit} (${lt.source === 'tokens' ? copy.measured : copy.estimated})`
-    : '—';
+    : '—');
   const ttft = rate.turn.active ? rate.turn.ttftMs : lt?.ttftMs ?? null;
-  ttftEl.textContent = ttft !== null || lt ? formatSecs(ttft) : '—';
+  view.text(ttftEl, ttft !== null || lt ? formatSecs(ttft) : '—');
   if (lt && lt.tokens > 0 && !lt.hasReasoning) {
-    reasoningEl.textContent = copy.noReasoning;
+    view.text(reasoningEl, copy.noReasoning);
   } else if (rate.live.chars > 0) {
     const share = rate.live.reasoningChars / Math.max(1, rate.live.chars);
-    reasoningEl.textContent = `${(share * 100).toFixed(0)}%`;
+    view.text(reasoningEl, `${(share * 100).toFixed(0)}%`);
   } else {
-    reasoningEl.textContent = '—';
+    view.text(reasoningEl, '—');
   }
-  connEl.textContent = rate.connection;
-  eventsEl.textContent = String(rate.eventsSeen);
+  view.text(connEl, rate.connection);
+  view.text(eventsEl, String(rate.eventsSeen));
   paintCache(rate.cache);
-  if (notice) stateText.textContent = notice;
-  if (!lt && !rate.busy) noteEl.textContent = copy.noData;
-  else if (!lt) noteEl.textContent = copy.inProgress;
-  else noteEl.textContent = copy.estimateNote;
+  if (notice) view.text(stateText, notice);
+  if (!lt && !rate.busy) view.text(noteEl, copy.noData);
+  else if (!lt) view.text(noteEl, copy.inProgress);
+  else view.text(noteEl, copy.estimateNote);
 };
 
 const describeError = (error: unknown): string => {
@@ -450,13 +397,16 @@ const withoutSession = (rate: RateResponse): RateResponse => ({
 });
 
 const poll = async (): Promise<void> => {
-  if (stopped || polling) return;
   // No origin is not a dead end: a relay client runs this page as a `srcDoc`,
   // where `window.location` is `about:srcdoc`. The service finds the server on
   // the machine that hosts it, so the page still asks and shows what it gets.
-  polling = true;
+  const requestedSession = sessionId;
   try {
-    const result = await host.serviceRequest({ method: 'GET', path: '/rate' });
+    const result = await host.serviceRequest({
+      method: 'GET',
+      path: requestedSession ? `/rate?sessionId=${encodeURIComponent(requestedSession)}` : '/rate',
+    });
+    if (!refresh.visible || requestedSession !== sessionId) return;
     if (result.status < 400) {
       const rate = JSON.parse(result.body) as RateResponse;
       // A page with no session must never show another session's numbers:
@@ -465,9 +415,7 @@ const poll = async (): Promise<void> => {
       render(sessionId === null && rate.sessionId !== null ? withoutSession(rate) : rate);
     } else render(null, `HTTP ${result.status}`);
   } catch (error) {
-    render(null, describeError(error));
-  } finally {
-    polling = false;
+    if (refresh.visible && requestedSession === sessionId) render(null, describeError(error));
   }
 };
 
@@ -494,27 +442,22 @@ const relabel = (): void => {
     copy.connection, copy.events,
   ];
   list.querySelectorAll('dt').forEach((dt, i) => {
-    if (i < labels.length) dt.textContent = labels[i];
+    if (i < labels.length) view.text(dt, labels[i]);
   });
-  titleEl.textContent = copy.title;
-  unitLine.textContent = copy.unit;
+  view.text(titleEl, copy.title);
+  view.text(unitLine, copy.unit);
 };
+
+const refresh = createRefreshLoop(root, poll, (visible) => {
+  spark.setVisible(visible);
+  dot.style.animationPlayState = visible ? 'running' : 'paused';
+});
 
 const mount = (): void => {
   relabel();
   root.append(titleEl, stateLine, bigEl, unitLine, sparkEl, cacheBlock, list, noteEl);
-  stopped = false;
   void configure(sessionId);
-  void poll();
-  requestAnimationFrame(paintSpark);
-  const loop = () => {
-    if (stopped) return;
-    window.setTimeout(async () => {
-      await poll();
-      loop();
-    }, document.hidden ? 1000 : 250);
-  };
-  loop();
+  refresh.start();
 };
 
 host.onReady((next) => {
@@ -529,9 +472,14 @@ host.onReady((next) => {
     return;
   }
   void configure(sessionId);
+  refresh.wake();
 });
 
 host.onSession((next) => {
+  const changed = sessionId !== (next?.id ?? null);
   sessionId = next?.id ?? null;
   void configure(sessionId);
+  if (changed) refresh.wake();
 });
+
+host.onSessionLifecycle(() => refresh.wake());

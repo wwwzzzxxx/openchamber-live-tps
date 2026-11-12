@@ -28,29 +28,40 @@ const check = (name, cond, extra = '') => {
 };
 
 // --- a DOM small enough for these two pages ----------------------------------
+const makeStats = () => ({ textWrites: 0, classWrites: 0, hiddenWrites: 0, styleWrites: 0, attributeWrites: 0, pathWrites: 0, layoutReads: 0, rafCallbacks: 0, rateRequests: 0 });
+
 class Style {
-  constructor() { this.props = {}; }
-  setProperty(name, value) { this.props[name] = String(value); }
+  constructor(stats) { this.props = {}; this.stats = stats; }
+  setProperty(name, value) { this.props[name] = String(value); this.stats.styleWrites += 1; }
   removeProperty(name) { delete this.props[name]; }
   getPropertyValue(name) { return this.props[name] ?? ''; }
+  set width(value) { this.setProperty('width', value); }
+  get width() { return this.getPropertyValue('width'); }
+  set animationPlayState(value) { this.setProperty('animation-play-state', value); }
+  get animationPlayState() { return this.getPropertyValue('animation-play-state'); }
 }
 
 class El {
-  constructor(tag) {
+  constructor(tag, stats) {
     this.tagName = String(tag).toUpperCase();
     this.children = [];
-    this.style = new Style();
+    this.stats = stats;
+    this.style = new Style(stats);
     this.dataset = {};
-    this.className = '';
+    this._className = '';
     this._text = '';
-    this.hidden = false;
+    this._hidden = false;
     this.attrs = {};
   }
   append(...nodes) { for (const node of nodes) this.children.push(node); }
   appendChild(node) { this.children.push(node); return node; }
   insertBefore(node) { this.children.push(node); return node; }
   removeChild(node) { this.children = this.children.filter((c) => c !== node); return node; }
-  setAttribute(key, value) { this.attrs[key] = String(value); }
+  setAttribute(key, value) {
+    this.attrs[key] = String(value);
+    this.stats.attributeWrites += 1;
+    if (key === 'd') this.stats.pathWrites += 1;
+  }
   getAttribute(key) { return this.attrs[key] ?? null; }
   hasAttribute(key) { return Object.hasOwn(this.attrs, key); }
   removeAttribute(key) { delete this.attrs[key]; }
@@ -68,8 +79,12 @@ class El {
     walk(this);
     return found;
   }
-  get scrollHeight() { return 0; }
-  set textContent(value) { this._text = String(value); this.children = []; }
+  set className(value) { this._className = value; this.stats.classWrites += 1; }
+  get className() { return this._className; }
+  set hidden(value) { this._hidden = value; this.stats.hiddenWrites += 1; }
+  get hidden() { return this._hidden; }
+  get scrollHeight() { this.stats.layoutReads += 1; return 0; }
+  set textContent(value) { this._text = String(value); this.children = []; this.stats.textWrites += 1; }
   get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
 }
 
@@ -138,16 +153,23 @@ const RATE = {
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
 const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
+  const stats = makeStats();
+  let clock = 0;
+  let nextId = 0;
+  let holdRates = false;
+  const timers = new Map();
+  const animations = new Map();
+  const observers = new Set();
   const posted = [];
   const listeners = [];
-  const root = new El('div');
-  const documentElement = new El('html');
+  const root = new El('div', stats);
+  const documentElement = new El('html', stats);
   const document = {
     documentElement,
     hidden: false,
     querySelector: (selector) => (selector === '#root' ? root : null),
-    createElement: (tag) => new El(tag),
-    createElementNS: (_ns, tag) => new El(tag),
+    createElement: (tag) => new El(tag, stats),
+    createElementNS: (_ns, tag) => new El(tag, stats),
     addEventListener: (type, fn) => { listeners.push([type, fn]); },
     removeEventListener: () => {},
   };
@@ -155,16 +177,19 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
   const win = {
     location,
     document,
-    parent: { postMessage: (message) => posted.push(message) },
+    parent: { postMessage: (message) => {
+      posted.push(message);
+      if (message.type === 'service-request' && message.payload?.path?.startsWith('/rate')) stats.rateRequests += 1;
+    } },
     addEventListener: (type, fn) => { listeners.push([type, fn]); },
     removeEventListener: () => {},
-    setTimeout: () => 0,
-    clearTimeout: () => {},
+    setTimeout: (fn, delay) => { const id = ++nextId; timers.set(id, { fn, at: clock + delay }); return id; },
+    clearTimeout: (id) => timers.delete(id),
     setInterval: () => 0,
     clearInterval: () => {},
-    requestAnimationFrame: () => 0,
-    cancelAnimationFrame: () => {},
-    performance: { now: () => Date.now() },
+    requestAnimationFrame: (fn) => { const id = ++nextId; animations.set(id, fn); return id; },
+    cancelAnimationFrame: (id) => animations.delete(id),
+    performance: { now: () => clock },
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
     navigator: { userAgent: 'node' },
   };
@@ -179,6 +204,11 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     parent: win.parent,
     MessageEvent,
     ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+    IntersectionObserver: class {
+      constructor(callback) { this.callback = callback; }
+      observe(target) { this.target = target; observers.add(this); }
+      disconnect() { observers.delete(this); }
+    },
     URL,
     TextEncoder,
     TextDecoder,
@@ -230,16 +260,57 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
 
   // Answer the page the way the host proxy would. `/watch` is accepted without
   // an origin: that is what a relay surface has to send.
-  const requests = posted.filter((message) => message && message.type === 'service-request');
-  for (const request of requests) {
-    if (request.payload?.path === '/watch') {
-      reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION }) });
-    } else if (request.payload?.path?.startsWith('/rate')) {
-      reply(request, { status: 200, body: JSON.stringify(rate) });
+  const replied = new Set();
+  const replyPending = (rateOverride) => {
+    for (const request of posted.filter((message) => message && message.type === 'service-request')) {
+      if (replied.has(request.id)) continue;
+      if (request.payload?.path === '/watch') {
+        replied.add(request.id);
+        reply(request, { status: 200, body: JSON.stringify({ ok: true, changed: true, connection: 'live', sessionId: SESSION }) });
+      } else if (request.payload?.path?.startsWith('/rate') && (!holdRates || rateOverride)) {
+        replied.add(request.id);
+        reply(request, { status: 200, body: JSON.stringify(rateOverride ?? rate) });
+      }
     }
-  }
+  };
+  replyPending();
+  const flush = async () => {
+    for (let i = 0; i < 10; i += 1) { await Promise.resolve(); replyPending(); }
+  };
+  const event = (type) => {
+    for (const [name, fn] of listeners.slice()) if (name === type) fn();
+  };
 
-  return { posted, rootEl: root, root: () => root.textContent };
+  return {
+    posted, stats, rootEl: root, root: () => root.textContent, flush,
+    resetStats: () => Object.assign(stats, makeStats()),
+    pendingFrames: () => animations.size,
+    setRate: (next) => { rate = next; },
+    holdRates: (next) => { holdRates = next; },
+    replyRatesWith: (next) => replyPending(next),
+    setDocumentHidden: (hidden) => { document.hidden = hidden; event('visibilitychange'); },
+    setIntersecting: (visible) => {
+      for (const observer of observers) observer.callback([{ target: observer.target, isIntersecting: visible, intersectionRatio: visible ? 1 : 0 }]);
+    },
+    setPageShown: (shown) => event(shown ? 'pageshow' : 'pagehide'),
+    session: (next) => dispatch({ channel, v: version, type: 'session', payload: { session: next } }),
+    lifecycle: (phase) => dispatch({ channel, v: version, type: 'session-lifecycle', payload: { sessionId: rate.sessionId, phase } }),
+    advance: async (ms) => {
+      const end = clock + ms;
+      await flush();
+      while (clock < end) {
+        clock = Math.min(end, clock + 1_000 / 60);
+        for (const [id, timer] of [...timers]) {
+          if (timer.at <= clock) { timers.delete(id); timer.fn(); }
+        }
+        await flush();
+        const frames = [...animations.values()];
+        animations.clear();
+        for (const fn of frames) { stats.rafCallbacks += 1; fn(clock); }
+        await flush();
+      }
+    },
+  };
 };
 
 const settle = async () => {
@@ -393,6 +464,82 @@ for (const surface of SURFACES) {
     bareWatch !== undefined && JSON.parse(bareWatch.payload.body).sessionId === null,
     bareWatch ? bareWatch.payload.body : '(no watch)',
   );
+
+  const quietRate = {
+    ...RATE,
+    curve: Array(24).fill(0),
+    live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 },
+  };
+  const activeRate = { ...RATE, busy: true, curve: Array(24).fill(LIVE_TPS) };
+  const quiet = runGuest(surface.bundle, surface.url, { rate: quietRate });
+  await quiet.flush();
+  quiet.resetStats();
+  await quiet.advance(10_000);
+  check(`${surface.name}: ten idle seconds own no animation callback`, quiet.stats.rafCallbacks === 0 && quiet.pendingFrames() === 0, JSON.stringify(quiet.stats));
+  check(`${surface.name}: identical idle answers cause no DOM writes or layout reads`,
+    Object.entries(quiet.stats).filter(([key]) => !['rateRequests', 'rafCallbacks'].includes(key)).every(([, value]) => value === 0), JSON.stringify(quiet.stats));
+  check(`${surface.name}: idle polling slows to once a second`, quiet.stats.rateRequests >= 9 && quiet.stats.rateRequests <= 10, JSON.stringify(quiet.stats));
+  console.log(`metrics ${surface.name}: 10 idle seconds ${JSON.stringify(quiet.stats)}`);
+
+  // A lifecycle event wakes the slower idle loop immediately, then live
+  // responses keep the original 250 ms cadence and smooth panning.
+  quiet.setRate(activeRate);
+  quiet.resetStats();
+  quiet.lifecycle('started');
+  await quiet.flush();
+  check(`${surface.name}: a new turn wakes idle polling immediately`, quiet.stats.rateRequests === 1, JSON.stringify(quiet.stats));
+  await quiet.advance(1_000);
+  check(`${surface.name}: an active curve still animates and polls promptly`, quiet.stats.pathWrites > 0 && quiet.stats.rafCallbacks > 0 && quiet.stats.rateRequests >= 4, JSON.stringify(quiet.stats));
+  quiet.setRate(quietRate);
+  await quiet.advance(300);
+  quiet.resetStats();
+  await quiet.advance(1_000);
+  check(`${surface.name}: a decayed curve releases its animation loop`, quiet.stats.rafCallbacks === 0 && quiet.stats.pathWrites === 0 && quiet.pendingFrames() === 0, JSON.stringify(quiet.stats));
+
+  const visibility = runGuest(surface.bundle, surface.url, { rate: activeRate });
+  await visibility.flush();
+  for (const [name, toggle] of [
+    ['background document', (hidden) => visibility.setDocumentHidden(hidden)],
+    ['collapsed iframe', (hidden) => visibility.setIntersecting(!hidden)],
+    ['page history', (hidden) => visibility.setPageShown(!hidden)],
+  ]) {
+    toggle(true);
+    visibility.resetStats();
+    await visibility.advance(1_000);
+    check(`${surface.name}: ${name} suspends polling and animation`, visibility.stats.rateRequests === 0 && visibility.stats.rafCallbacks === 0 && visibility.pendingFrames() === 0, JSON.stringify(visibility.stats));
+    check(`${surface.name}: ${name} pauses the CSS status pulse`, findByClass(visibility.rootEl, 'dot').style.animationPlayState === 'paused');
+    toggle(false);
+    await visibility.flush();
+    check(`${surface.name}: returning from ${name} requests fresh data immediately`, visibility.stats.rateRequests === 1, JSON.stringify(visibility.stats));
+    await visibility.advance(100);
+    check(`${surface.name}: returning from ${name} resumes the curve`, visibility.stats.pathWrites > 0, JSON.stringify(visibility.stats));
+  }
+
+  // A slow reply from the old chat must not repaint after a session switch;
+  // the pending wake follows it with one request for the newly selected chat.
+  const switching = runGuest(surface.bundle, surface.url, { rate: activeRate });
+  await switching.flush();
+  switching.holdRates(true);
+  await switching.advance(300);
+  switching.setRate({ ...quietRate, sessionId: 'ses_new', running: { ...RATE.running, tps: 55 } });
+  switching.session({ id: 'ses_new', title: 'new chat', busy: false });
+  switching.replyRatesWith({ ...activeRate, running: { ...RATE.running, tps: 99 } });
+  await switching.flush();
+  check(`${surface.name}: a late answer from the previous chat is ignored`, !switching.root().includes('99.0'), switching.root());
+  switching.holdRates(false);
+  await switching.flush();
+  check(`${surface.name}: switching chat immediately fetches that chat's data`, switching.root().includes('55.0') && switching.posted.some((message) => message.payload?.path === '/rate?sessionId=ses_new'), switching.root());
+
+  const stalled = runGuest(surface.bundle, surface.url, { rate: activeRate });
+  await stalled.flush();
+  stalled.holdRates(true);
+  await stalled.advance(2_500);
+  stalled.resetStats();
+  await stalled.advance(1_000);
+  check(`${surface.name}: a stalled service does not keep repainting a frozen curve`, stalled.stats.rafCallbacks === 0 && stalled.stats.pathWrites === 0 && stalled.pendingFrames() === 0, JSON.stringify(stalled.stats));
+  stalled.holdRates(false);
+  await stalled.advance(100);
+  check(`${surface.name}: a recovered service starts the curve again`, stalled.stats.pathWrites > 0, JSON.stringify(stalled.stats));
 }
 
 console.log(failures === 0 ? '\nALL PAGE SMOKE TESTS PASSED' : `\n${failures} FAILURES`);

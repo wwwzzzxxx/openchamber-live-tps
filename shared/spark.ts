@@ -102,12 +102,85 @@ export function drawSpark(
   scale: number,
 ): void {
   const { line, area } = sparkPaths(frame, now, w, h, scale);
-  parts.line.setAttribute('d', line);
-  parts.area.setAttribute('d', area);
+  if (parts.line.getAttribute('d') !== line) parts.line.setAttribute('d', line);
+  if (parts.area.getAttribute('d') !== area) parts.area.setAttribute('d', area);
 }
 
 /** Drop the drawn curve; used when the answering record belongs to no session. */
 export function clearSpark(parts: { line: SVGPathElement; area: SVGPathElement }): void {
-  parts.line.setAttribute('d', '');
-  parts.area.setAttribute('d', '');
+  if (parts.line.getAttribute('d')) parts.line.setAttribute('d', '');
+  if (parts.area.getAttribute('d')) parts.area.setAttribute('d', '');
+}
+
+/** Animate only a visible, moving curve; a quiet page owns no animation callback. */
+export function createSparkAnimator(parts: ReturnType<typeof makeSparkSvg>, w: number, h: number) {
+  let frame: SparkFrame | null = null;
+  let receivedAt = 0;
+  let paintedAt = 0;
+  let scale = 1;
+  let moving = false;
+  let visible = false;
+  let needsStatic = false;
+  let animation: number | null = null;
+
+  const cancel = (): void => {
+    if (animation !== null) cancelAnimationFrame(animation);
+    animation = null;
+  };
+  const schedule = (): void => {
+    if (visible && moving && animation === null) animation = requestAnimationFrame(paint);
+  };
+  const paint = (): void => {
+    animation = null;
+    if (!visible || !moving || !frame) return;
+    const at = performance.now();
+    const elapsed = Math.min(2_000, at - receivedAt);
+    if (at - paintedAt >= 30) {
+      paintedAt = at;
+      scale = nextScale(scale, frame.values);
+      drawSpark(parts, frame, frame.at + elapsed, w, h, scale);
+    }
+    // A stalled request freezes after the projection limit. The next response
+    // starts the animation again, instead of redrawing a frozen path forever.
+    if (elapsed < 2_000) schedule();
+  };
+  const paintStatic = (): void => {
+    if (!visible || !needsStatic || !frame) return;
+    needsStatic = false;
+    scale = nextScale(scale, frame.values);
+    drawSpark(parts, frame, frame.at, w, h, scale);
+  };
+
+  return {
+    get moving(): boolean { return moving; },
+    setVisible(next: boolean): void {
+      visible = next;
+      if (!visible) cancel();
+      else if (moving) schedule();
+      else paintStatic();
+    },
+    update(next: SparkFrame | null): void {
+      const hadFrame = frame !== null;
+      const wasMoving = moving;
+      frame = next;
+      receivedAt = performance.now();
+      if (!frame || frame.values.length === 0) {
+        moving = false;
+        needsStatic = false;
+        scale = 1;
+        cancel();
+        clearSpark(parts);
+        return;
+      }
+      moving = frame.values.some((value) => value > 0.05);
+      needsStatic = needsStatic || !hadFrame || (wasMoving && !moving);
+      if (moving) {
+        needsStatic = false;
+        schedule();
+      } else {
+        cancel();
+        paintStatic();
+      }
+    },
+  };
 }
