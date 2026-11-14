@@ -9,3 +9,6 @@ shell-marker.txt
 .live-tps-day.json.*.tmp
 .live-tps-options.json
 .live-tps-options.json.*.tmp
+
+# Local agent notes/skills for this repo; never published.
+.agent/
