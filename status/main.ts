@@ -2,6 +2,8 @@ import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { createSparkAnimator, makeSparkSvg, type SparkFrame } from '../shared/spark';
 import { createRefreshLoop, createView } from '../shared/refresh';
+import { formatDayClock, formatDayTokens, localeFromTag, type DayPayload, type Locale } from '../shared/day';
+import { DEFAULT_OPTIONS, optionsFrom, type ViewOptions } from '../shared/options';
 
 type Live = {
   tps: number;
@@ -99,6 +101,16 @@ const COPY = {
     stepHit: '单步',
     totalHit: '累计',
     inProgress: '进行中',
+    dayToday: '今日',
+    dayUnit: 'Token',
+    cache: '缓存读取',
+    cacheWrite: '缓存写入',
+    dayUpdated: '更新于',
+    dayInput: '输入',
+    dayOutput: '输出',
+    dayReasoning: '推理',
+    dayZero: '今天还没有已完成的对话',
+    dayLoading: '统计中…',
   },
   en: {
     unit: 'tok/s',
@@ -118,6 +130,16 @@ const COPY = {
     stepHit: 'step',
     totalHit: 'total',
     inProgress: 'in progress',
+    dayToday: 'today',
+    dayUnit: 'tok',
+    cache: 'cache read',
+    cacheWrite: 'cache write',
+    dayUpdated: 'updated',
+    dayInput: 'in',
+    dayOutput: 'out',
+    dayReasoning: 'think',
+    dayZero: 'no completed turns today',
+    dayLoading: 'counting…',
   },
 } as const;
 
@@ -136,6 +158,7 @@ const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
 let copy: Copy = COPY.zh;
+let locale: Locale = 'zh';
 let origin: string | null = null;
 let session: HostSession = null;
 let mounted = false;
@@ -204,6 +227,62 @@ const makeCacheRow = (): CacheRow => {
 const stepCache = makeCacheRow();
 const totalCache = makeCacheRow();
 
+// --- the daily token block ----------------------------------------------------
+
+type DayPart = { root: HTMLElement; key: HTMLElement; val: HTMLElement };
+
+const makeDayPart = (): DayPart => {
+  const root = document.createElement('span');
+  root.className = 'day-part';
+  const key = document.createElement('span');
+  key.className = 'k';
+  const val = document.createElement('span');
+  val.className = 'v';
+  root.append(key, val);
+  return { root, key, val };
+};
+
+const makeDaySep = (): HTMLElement => {
+  const sep = document.createElement('span');
+  sep.className = 'day-sep';
+  sep.textContent = '·';
+  return sep;
+};
+
+const dayTotalRow = document.createElement('div');
+dayTotalRow.className = 'row daytotal';
+const dayTag = document.createElement('span');
+dayTag.className = 'tag';
+const dayValue = document.createElement('span');
+dayValue.className = 'day-value';
+const dayUnit = document.createElement('span');
+dayUnit.className = 'unit';
+dayTotalRow.append(dayTag, dayValue, dayUnit);
+
+const dayWhenRow = document.createElement('div');
+dayWhenRow.className = 'row meta';
+const dayWhen = document.createElement('span');
+const dayWhenSep = makeDaySep();
+const dayCache = makeDayPart();
+const dayZeroEl = document.createElement('span');
+dayWhenRow.append(dayWhen, dayWhenSep, dayCache.root, dayZeroEl);
+
+const dayPartsRow = document.createElement('div');
+dayPartsRow.className = 'row meta';
+const dayIn = makeDayPart();
+const dayOut = makeDayPart();
+const dayReason = makeDayPart();
+const dayWrite = makeDayPart();
+const daySep1 = makeDaySep();
+const daySep2 = makeDaySep();
+const daySep3 = makeDaySep();
+dayPartsRow.append(dayIn.root, daySep1, dayOut.root, daySep2, dayReason.root, daySep3, dayWrite.root);
+
+let dayPayload: DayPayload | null = null;
+let dayNotice: string | null = null;
+let options: ViewOptions = { ...DEFAULT_OPTIONS };
+let lastRate: RateResponse | null = null;
+
 const resolveOrigin = (): string | null => {
   try {
     const url = new URL(window.location.href);
@@ -271,7 +350,7 @@ const barWidth = (value: number | null | undefined): string => (
  * reported a cache block, rather than drawn as a misleading 0%.
  */
 const paintCache = (info: CacheInfo | null | undefined): void => {
-  const present = !!info && info.steps > 0 && info.hit + info.miss > 0;
+  const present = options.cache && !!info && info.steps > 0 && info.hit + info.miss > 0;
   view.hidden(stepCache.root, !present);
   view.hidden(totalCache.root, !present);
   if (!present || !info) {
@@ -302,7 +381,102 @@ const paintCache = (info: CacheInfo | null | undefined): void => {
   view.text(totalCache.delta, '');
 };
 
+/**
+ * The daily block: total, when + cache reads, then the remaining parts. It is
+ * painted from pushed snapshots; the TPS rows above keep their own poll.
+ */
+const paintDay = (): void => {
+  if (!options.day) {
+    view.hidden(dayTotalRow, true);
+    view.hidden(dayWhenRow, true);
+    view.hidden(dayPartsRow, true);
+    return;
+  }
+  view.text(dayTag, copy.dayToday);
+  view.text(dayUnit, copy.dayUnit);
+  const payload = dayPayload;
+  const live = !!payload && payload.ok && !payload.error;
+  if (!live) {
+    view.hidden(dayTotalRow, true);
+    view.hidden(dayWhen, true);
+    view.hidden(dayWhenSep, true);
+    view.hidden(dayCache.root, true);
+    view.hidden(dayPartsRow, true);
+    view.text(dayZeroEl, dayNotice ?? copy.dayLoading);
+    view.hidden(dayZeroEl, false);
+    return;
+  }
+  const total = payload.today.total;
+  if (total <= 0) {
+    view.hidden(dayTotalRow, true);
+    view.hidden(dayWhen, true);
+    view.hidden(dayWhenSep, true);
+    view.hidden(dayCache.root, true);
+    view.hidden(dayPartsRow, true);
+    view.text(dayZeroEl, payload.refreshing ? copy.dayLoading : copy.dayZero);
+    view.hidden(dayZeroEl, false);
+    return;
+  }
+  view.text(dayValue, formatDayTokens(total, locale));
+  view.hidden(dayTotalRow, false);
+  view.text(dayWhen, `${copy.dayUpdated} ${formatDayClock(payload.updatedAt)}`);
+  view.hidden(dayWhen, false);
+  view.hidden(dayWhenSep, false);
+  view.text(dayCache.key, copy.cache);
+  view.text(dayCache.val, formatDayTokens(payload.today.cacheRead, locale));
+  view.hidden(dayCache.root, false);
+  view.hidden(dayZeroEl, true);
+  view.text(dayIn.key, copy.dayInput);
+  view.text(dayOut.key, copy.dayOutput);
+  view.text(dayReason.key, copy.dayReasoning);
+  view.text(dayIn.val, formatDayTokens(payload.today.input, locale));
+  view.text(dayOut.val, formatDayTokens(payload.today.output, locale));
+  view.text(dayReason.val, formatDayTokens(payload.today.reasoning, locale));
+  view.hidden(dayPartsRow, false);
+  const write = payload.today.cacheWrite;
+  if (write > 0) {
+    view.text(dayWrite.key, copy.cacheWrite);
+    view.text(dayWrite.val, formatDayTokens(write, locale));
+    view.hidden(dayWrite.root, false);
+    view.hidden(daySep3, false);
+  } else {
+    view.hidden(dayWrite.root, true);
+    view.hidden(daySep3, true);
+  }
+};
+
+/** The optional blocks; both surfaces follow the service, never their own copy. */
+const readOptions = async (): Promise<void> => {
+  try {
+    const result = await host.serviceRequest({ method: 'GET', path: '/options' });
+    if (result.status < 400) options = optionsFrom(JSON.parse(result.body));
+  } catch {
+    // Keep the defaults; the service may not be up yet.
+  }
+  render(lastRate);
+  paintDay();
+  fitHeight();
+};
+
+/** One read when the frame mounts; every later change is pushed on `day`. */
+const readDay = async (): Promise<void> => {
+  try {
+    const result = await host.serviceRequest({ method: 'GET', path: '/day' });
+    if (result.status >= 400) {
+      dayNotice = `HTTP ${result.status}`;
+    } else {
+      dayPayload = JSON.parse(result.body) as DayPayload;
+      dayNotice = null;
+    }
+  } catch (error) {
+    dayNotice = describeError(error);
+  }
+  paintDay();
+  fitHeight();
+};
+
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
+  lastRate = rate;
   if (!rate) {
     refresh.setActive(false);
     view.className(dot, 'dot');
@@ -374,6 +548,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     parts.push(copy.noReasoning);
   }
   view.text(lastEl, parts.length > 0 ? parts.join(' · ') : (turnActive ? copy.inProgress : copy.noData));
+  view.hidden(lastEl, !options.detail);
 
   paintCache(rate.cache);
 
@@ -438,6 +613,9 @@ const poll = async (): Promise<void> => {
         if (now - lastReassertAt >= REASSERT_MIN_MS) {
           lastReassertAt = now;
           configuredKey = '';
+          // A restarted service keeps the day on disk but this frame may have
+          // missed the pushes in between; take one snapshot with the re-watch.
+          void readDay();
           await configure(session?.id ?? null);
         }
       }
@@ -474,16 +652,36 @@ const refresh = createRefreshLoop(root, poll, (visible) => {
 });
 
 const mount = (): void => {
-  root.append(row1, sparkEl, row2, stepCache.root, totalCache.root);
+  root.append(row1, sparkEl, row2, stepCache.root, totalCache.root, dayTotalRow, dayWhenRow, dayPartsRow);
+  host.onServiceEvent((event) => {
+    if (event.topic === 'options') {
+      const next = optionsFrom(event.data);
+      const changed = next.cache !== options.cache || next.day !== options.day || next.detail !== options.detail;
+      options = next;
+      render(lastRate);
+      if (changed && options.day && dayPayload === null) void readDay();
+      else paintDay();
+      fitHeight();
+      return;
+    }
+    if (event.topic !== 'day' || !event.data || typeof event.data !== 'object') return;
+    dayPayload = event.data as unknown as DayPayload;
+    dayNotice = null;
+    paintDay();
+    fitHeight();
+  });
   view.text(unitEl, copy.unit);
   fitHeight(true);
   window.addEventListener('resize', () => fitHeight(true));
   void configure(session?.id ?? null);
+  void readOptions();
+  void readDay();
   refresh.start();
 };
 
 host.onReady((next) => {
-  copy = next.locale.toLowerCase().startsWith('zh') ? COPY.zh : COPY.en;
+  locale = localeFromTag(next.locale);
+  copy = COPY[locale];
   applyHostReady(next, document.documentElement);
   session = next.session ? { id: next.session.id, title: next.session.title, busy: next.session.busy } : null;
   origin = resolveOrigin();
@@ -493,6 +691,7 @@ host.onReady((next) => {
     mount();
     return;
   }
+  paintDay();
   void configure(session?.id ?? null);
   fitHeight(true);
   refresh.wake();

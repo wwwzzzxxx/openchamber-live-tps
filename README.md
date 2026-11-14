@@ -2,8 +2,9 @@ English | [简体中文](README.zh-CN.md)
 
 # OpenChamber Live TPS
 
-A `Live TPS` section for the Work Status panel: live generation speed for the open
-session, plus the last turn's average and time to first token.
+A `TPS & Token` section for the Work Status panel: live generation speed for the
+open session, the last turn's average and time to first token, and the day's
+provider-reported token usage.
 
 ![The Live TPS section in the Work Status panel: headline, 30 s curve, last-step and total cache-hit rates](docs/work-status.png)
 
@@ -21,6 +22,7 @@ no tokenizer. See [Counting](#counting).
 | `step hit` | cache hit rate of the last settled step (an API call), with the change since the step before; drawn as a bar under the curve |
 | `total hit` | cache hit rate of the whole conversation, including its sub-sessions |
 | cache details | hit/miss tokens, output tokens, step and sub-session counts, cost |
+| `today` tokens | provider-reported total for assistant messages completed since local midnight, with the cache-read amount and the input/output/reasoning split |
 
 The floating panel shows the same numbers with the full breakdown:
 
@@ -28,7 +30,7 @@ The floating panel shows the same numbers with the full breakdown:
 
 ## Requirements
 
-- OpenChamber ≥ 2.0.4 (background counting needs a host that supports `sessionEvents`; verified on 2.7.0)
+- OpenChamber ≥ 2.7.0 (`panels.emit`, `onServiceEvent`, `keepRunning`)
 - OpenCode v1.2.19+
 - Node.js v22+ on `PATH`
 
@@ -133,6 +135,49 @@ so the numbers keep accumulating. The eight most recently active top-level conve
 are counted (sub-sessions follow their parent). `contributes.sessionEvents` is declared too,
 so the host can push turn boundaries straight to the service. Opening the panel shows what
 is already there; the host supervises the process and totals come back from disk.
+
+## Daily tokens
+
+The service also keeps the local day's usage. `session.step.ended` /
+`session.step.failed` settle once per **model call** with the provider's
+`tokens` and `cost`, and every session counts — watched or not — so the day
+stays current with no panel open.
+
+```text
+input + output + reasoning + cache read + cache write
+```
+
+That is the honest usage number: cache reads are the context every step
+re-reads, and they dominate a long session. The status section shows the total,
+the cache-read amount, and the input/output/reasoning split; the panel adds the
+hourly bars and the top models and sessions. Those figures are pushed with
+`createServiceHost(...).emit('day', snapshot)` and repaint on
+`host.onServiceEvent`; no timer reads them.
+
+History is read only when it must be: the first run of the day reads today's
+assistant messages once; a later start (or a stream reconnect) reads only
+messages newer than each session's saved cursor. The cached ledger rolls over at
+local midnight.
+
+Day boundaries come from the machine the service runs on (`Date`, no fixed
+offset): UTC+8 and every other zone roll over at that zone's own midnight. The
+service test suite runs one instance under `TZ=UTC` to prove the day key moves
+with the system zone.
+
+## Options
+
+A fresh install draws the waveform and nothing else. The panel carries three
+checkboxes — `hits`, `today`, and `last turn` — each off by default:
+
+- **hits** — the step/total cache hit-rate bars and their cache numbers;
+- **today** — the provider-reported daily token block;
+- **last turn** — the previous turn's average, TTFT, reasoning share, and the
+  estimate note.
+
+The choice is saved by the service (`.live-tps-options.json` beside it) and
+pushed to both surfaces as an `options` service event, so the status section
+follows the panel without polling. While `today` is off the service does not
+read daily history at all; switching it on triggers one catch-up.
 
 ## Architecture
 

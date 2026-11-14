@@ -87,6 +87,9 @@ const svc = spawn(process.execPath, ['service/main.js'], {
     OPENCHAMBER_SERVICE_TOKEN: SERVICE_TOKEN,
     OPENCHAMBER_LIVE_TPS_STATE: STATE_FILE,
     OPENCHAMBER_DATA_DIR: SMOKE_DATA_DIR,
+    // The day boundary must follow the machine's zone, not a hardcoded +08:00.
+    // Running the whole file under UTC proves it moves with TZ.
+    TZ: 'UTC',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -857,6 +860,66 @@ if (process.platform === 'linux' && fs.existsSync('/proc/net/tcp') && fs.existsS
 }
 
 // --- persistence: a restarted service still answers --------------------------
+// --- the view options -------------------------------------------------------
+// A fresh install draws the waveform alone; the optional blocks start off.
+const optionDefaults = await (await svcFetch('/options')).json();
+check('options: every optional block is off by default', optionDefaults.cache === false && optionDefaults.day === false && optionDefaults.detail === false, JSON.stringify(optionDefaults));
+const optionOn = await (await svcFetch('/options', {
+  method: 'POST',
+  body: JSON.stringify({ day: true, detail: true }),
+})).json();
+check('options: only the asked block turns on', optionOn.day === true && optionOn.detail === true && optionOn.cache === false, JSON.stringify(optionOn));
+check('options: the choice is stored beside the TPS state', fs.existsSync(`${STATE_FILE}.options.json`), `${STATE_FILE}.options.json`);
+
+// --- the daily token ledger -------------------------------------------------
+// It rides the same event stream and counts every session, not only the one a
+// page watches; tokens, cache and cost come from the settled step itself.
+const dayBefore = await (await svcFetch('/day')).json();
+ev('session.step.started', {
+  sessionID: OTHER,
+  assistantMessageID: 'day_msg',
+  providerID: 'p1',
+  modelID: 'm1',
+});
+ev('session.step.ended', {
+  sessionID: OTHER,
+  assistantMessageID: 'day_msg',
+  tokens: { input: 5, output: 3, reasoning: 2, cache: { read: 10, write: 1 } },
+  cost: 0.02,
+});
+await sleep(250);
+const dayAfter = await (await svcFetch('/day')).json();
+const dayTotalBefore = dayBefore.today?.total ?? 0;
+const dayMessagesBefore = dayBefore.today?.messages ?? 0;
+check('day: a step on an unwatched session is counted', dayAfter.ok === true && dayAfter.today.total === dayTotalBefore + 21, JSON.stringify({ before: dayTotalBefore, after: dayAfter.today }));
+const utcDay = new Date().toISOString().slice(0, 10);
+const utcMidnight = Date.parse(`${utcDay}T00:00:00.000Z`);
+check('day: the day key follows the process time zone', dayAfter.day === utcDay, `${dayAfter.day} vs ${utcDay}`);
+check('day: the day starts at that zone midnight', dayAfter.dayStart === utcMidnight, `${dayAfter.dayStart} vs ${utcMidnight}`);
+check('day: the step adds one assistant message', dayAfter.today.messages === dayMessagesBefore + 1, JSON.stringify(dayAfter.today));
+check('day: cache read and write are part of the total', dayAfter.today.cacheRead === (dayBefore.today?.cacheRead ?? 0) + 10 && dayAfter.today.cacheWrite === (dayBefore.today?.cacheWrite ?? 0) + 1, JSON.stringify(dayAfter.today));
+check('day: the provider cost is summed', Math.abs(dayAfter.today.cost - ((dayBefore.today?.cost ?? 0) + 0.02)) < 1e-9, JSON.stringify({ before: dayBefore.today?.cost, after: dayAfter.today.cost }));
+check('day: the model row takes the step model', dayAfter.models.some((row) => row.key === 'p1/m1' && row.total >= 21), JSON.stringify(dayAfter.models));
+check('day: the session row is listed', dayAfter.sessions.some((row) => row.id === OTHER && row.total >= 21), JSON.stringify(dayAfter.sessions));
+
+// The same message id settling again replaces its earlier value instead of
+// being counted twice (a retry, or a catch-up overlapping a stream event).
+ev('session.step.ended', {
+  sessionID: OTHER,
+  assistantMessageID: 'day_msg',
+  tokens: { input: 6, output: 9, reasoning: 2, cache: { read: 10, write: 1 } },
+  cost: 0.03,
+});
+await sleep(250);
+const dayRessed = await (await svcFetch('/day')).json();
+check('day: a re-settled step replaces its old value', dayRessed.today.total === dayTotalBefore + 28 && dayRessed.today.messages === dayMessagesBefore + 1, JSON.stringify({ total: dayRessed.today.total, messages: dayRessed.today.messages }));
+
+await sleep(1_200);
+check('day: the aggregate is cached beside the TPS state', fs.existsSync(`${STATE_FILE}.day.json`), `${STATE_FILE}.day.json`);
+const daySaved = JSON.parse(fs.readFileSync(`${STATE_FILE}.day.json`, 'utf8'));
+check('day: the saved file carries the contribution map', Object.keys(daySaved.payload?.contributions ?? {}).includes('day_msg'), Object.keys(daySaved.payload?.contributions ?? {}).join(','));
+fs.rmSync(`${STATE_FILE}.day.json`, { force: true });
+fs.rmSync(`${STATE_FILE}.options.json`, { force: true });
 // Closing OpenChamber kills this process. The numbers already measured are on
 // disk, so the panel shows the last turn straight away instead of sitting
 // empty until the next conversation finishes.
@@ -1096,6 +1159,8 @@ await once(svc5, 'exit');
 fs.rmSync(relayDataDir, { recursive: true, force: true });
 
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
+
+
 svc.kill();
 sseServer.close();
 fs.rmSync(STATE_FILE, { force: true });

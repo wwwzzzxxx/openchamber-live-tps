@@ -2,6 +2,16 @@ import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 import { createSparkAnimator, makeSparkSvg, type SparkFrame } from '../shared/spark';
 import { createRefreshLoop, createView } from '../shared/refresh';
+import { DEFAULT_OPTIONS, optionsFrom, type ViewOptions } from '../shared/options';
+import {
+  formatDayClock,
+  formatDayCount,
+  formatDayDate,
+  formatDayTokens,
+  localeFromTag,
+  type DayPayload,
+  type Locale,
+} from '../shared/day';
 
 const SPARK_W = 248;
 const SPARK_H = 36;
@@ -101,6 +111,32 @@ const COPY = {
     noData: '打开一个对话并让模型生成后显示',
     inProgress: '本轮进行中…',
     estimateNote: '实时值按字符数启发式换算（字符/4，按模型校准）；上轮均值优先用提供商上报的真实 token。',
+    dayTitle: '今日 Token',
+    dayUnit: 'Token',
+    dayUpdated: '更新于',
+    dayDetail: '今日明细',
+    dayInput: '输入',
+    dayOutput: '输出',
+    dayReasoning: '推理',
+    dayCacheRead: '缓存读取',
+    dayCacheWrite: '缓存写入',
+    dayTotal: '合计',
+    dayHourly: '按小时',
+    dayModels: '按模型',
+    daySessions: '按会话',
+    dayTurns: '轮对话',
+    dayScanned: '已扫描',
+    daySessionsUnit: '个会话',
+    dayMessagesUnit: '条消息',
+    dayNote: '口径：input + output + reasoning + 缓存读取 + 缓存写入，取提供商上报的已结算值；只统计本地自然日内完成的助手消息。',
+    dayZero: '今天还没有已完成的对话',
+    dayPartial: '（部分会话读取失败）',
+    dayRefreshing: '刷新中',
+    dayLoading: '统计中…',
+    dayFailed: '暂时读不到用量',
+    optCache: '命中率',
+    optDay: '今日统计',
+    optDetail: '上轮明细',
   },
   en: {
     title: 'Live TPS',
@@ -123,6 +159,32 @@ const COPY = {
     noData: 'Open a chat and let the model generate',
     inProgress: 'Turn in progress…',
     estimateNote: 'Live values estimate tokens from characters (chars/4), corrected per model; last-turn averages prefer provider-reported tokens.',
+    dayTitle: 'Token per Day',
+    dayUnit: 'Token',
+    dayUpdated: 'updated',
+    dayDetail: "Today's breakdown",
+    dayInput: 'input',
+    dayOutput: 'output',
+    dayReasoning: 'reasoning',
+    dayCacheRead: 'cache read',
+    dayCacheWrite: 'cache write',
+    dayTotal: 'total',
+    dayHourly: 'per hour',
+    dayModels: 'by model',
+    daySessions: 'by session',
+    dayTurns: 'turns',
+    dayScanned: 'scanned',
+    daySessionsUnit: 'sessions',
+    dayMessagesUnit: 'messages',
+    dayNote: 'Counts input + output + reasoning + cache read + cache write as reported by the provider for assistant messages completed since local midnight.',
+    dayZero: 'no completed turns today',
+    dayPartial: '(some sessions could not be read)',
+    dayRefreshing: 'refreshing',
+    dayLoading: 'counting…',
+    dayFailed: 'usage is unavailable',
+    optCache: 'hits',
+    optDay: 'today',
+    optDetail: 'last turn',
   },
 } as const;
 
@@ -134,10 +196,15 @@ const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
 let copy: Copy = COPY.zh;
+let locale: Locale = 'zh';
+let options: ViewOptions = { ...DEFAULT_OPTIONS };
+let lastRate: RateResponse | null = null;
 let origin: string | null = null;
 let sessionId: string | null = null;
 let mounted = false;
 let configuredKey = '';
+/** Floor between watch re-asserts, so a down service costs one call a second. */
+let lastReassertAt = 0;
 const titleEl = document.createElement('h1');
 const stateLine = document.createElement('div');
 const dot = document.createElement('span');
@@ -163,13 +230,21 @@ for (const path of [sparkParts.line, sparkParts.area]) {
 }
 sparkEl.append(sparkParts.svg);
 const list = document.createElement('dl');
+/** The label that belongs to each value row, so a hidden block hides both. */
+const rowDts = new WeakMap<HTMLElement, HTMLElement>();
 const row = (label: string): HTMLElement => {
   const dt = document.createElement('dt');
   dt.textContent = label;
   const dd = document.createElement('dd');
   dd.textContent = '—';
+  rowDts.set(dd, dt);
   list.append(dt, dd);
   return dd;
+};
+const hideRow = (dd: HTMLElement, hidden: boolean): void => {
+  if (dd.hidden !== hidden) dd.hidden = hidden;
+  const dt = rowDts.get(dd);
+  if (dt && dt.hidden !== hidden) dt.hidden = hidden;
 };
 const lastEl = row('');
 const ttftEl = row('');
@@ -214,6 +289,260 @@ const connEl = row('');
 const eventsEl = row('');
 const noteEl = document.createElement('div');
 noteEl.className = 'note';
+
+/** The only place the options are edited; both frames follow the service. */
+const optionsBar = document.createElement('div');
+optionsBar.className = 'opts';
+const optionBox = (key: keyof ViewOptions): HTMLInputElement => {
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  const label = document.createElement('label');
+  label.className = 'opt';
+  label.append(box);
+  const text = document.createElement('span');
+  text.className = 'opt-text';
+  label.append(text);
+  optionsBar.append(label);
+  box.addEventListener('change', () => {
+    options = { ...options, [key]: box.checked };
+    applyOptions();
+    render(lastRate);
+    void saveOptions();
+  });
+  return box;
+};
+const cacheBox = optionBox('cache');
+const dayBox = optionBox('day');
+const detailBox = optionBox('detail');
+const optionLabels = (): void => {
+  const spans = optionsBar.querySelectorAll('label .opt-text');
+  const texts = [copy.optCache, copy.optDay, copy.optDetail];
+  spans.forEach((span, i) => view.text(span as HTMLElement, texts[i] ?? ''));
+};
+
+const saveOptions = async (): Promise<void> => {
+  try {
+    await host.serviceRequest({
+      method: 'POST',
+      path: '/options',
+      body: JSON.stringify(options),
+    });
+  } catch {
+    // The service may be down; the next mount reads what it last saved.
+  }
+};
+
+/** Show or hide each optional block, and keep the checkboxes in step. */
+const applyOptions = (): void => {
+  cacheBox.checked = options.cache;
+  dayBox.checked = options.day;
+  detailBox.checked = options.detail;
+  const detail = options.detail;
+  hideRow(lastEl, !detail);
+  hideRow(ttftEl, !detail);
+  hideRow(reasoningEl, !detail);
+  hideRow(connEl, !detail);
+  hideRow(eventsEl, !detail);
+  view.hidden(noteEl, !detail);
+  const cache = options.cache;
+  view.hidden(cacheBlock, !cache);
+  hideRow(hitMissEl, !cache);
+  hideRow(outputEl, !cache);
+  hideRow(stepsEl, !cache);
+  hideRow(costEl, !cache);
+  view.hidden(dayBlock, !options.day);
+};
+
+// --- the daily token block ----------------------------------------------------
+
+const dayBlock = document.createElement('div');
+dayBlock.className = 'dayblock';
+const dayHead = document.createElement('div');
+dayHead.className = 'dhead';
+const dayTitleEl = document.createElement('h2');
+const dayDateEl = document.createElement('span');
+dayDateEl.className = 'ddate';
+dayHead.append(dayTitleEl, dayDateEl);
+const dayBigRow = document.createElement('div');
+dayBigRow.className = 'dbigrow';
+const dayBig = document.createElement('div');
+dayBig.className = 'dbig muted';
+dayBig.textContent = '—';
+const dayUnitEl = document.createElement('span');
+dayUnitEl.className = 'dunit';
+dayBigRow.append(dayBig, dayUnitEl);
+const daySub = document.createElement('div');
+daySub.className = 'dsub';
+const dayBody = document.createElement('div');
+const dayFoot = document.createElement('div');
+dayFoot.className = 'dfoot';
+dayBlock.append(dayHead, dayBigRow, daySub, dayBody, dayFoot);
+
+let dayPayload: DayPayload | null = null;
+let dayNotice: string | null = null;
+
+const dnode = <K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className: string | null,
+  text?: string,
+): HTMLElementTagNameMap[K] => {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+};
+
+const dayShare = (value: number, total: number): number =>
+  total > 0 ? Math.min(100, Math.round((value / total) * 100)) : 0;
+
+const clearDayBody = (): void => {
+  while (dayBody.firstChild) dayBody.removeChild(dayBody.firstChild);
+};
+
+const dayDetailBlock = (payload: DayPayload): HTMLElement => {
+  const section = dnode('section', 'dsection');
+  section.append(dnode('h3', null, copy.dayDetail));
+  const dl = dnode('dl', 'detail');
+  const rows: Array<[string, number]> = [
+    [copy.dayInput, payload.today.input],
+    [copy.dayOutput, payload.today.output],
+    [copy.dayReasoning, payload.today.reasoning],
+    [copy.dayCacheRead, payload.today.cacheRead],
+    [copy.dayCacheWrite, payload.today.cacheWrite],
+  ];
+  for (const [label, value] of rows) {
+    const dt = dnode('dt', null, label);
+    const dd = dnode('dd', null, formatDayTokens(value, locale));
+    if (value > 0) {
+      dd.append(dnode('span', 'share', `${dayShare(value, payload.today.total)}%`));
+    }
+    dl.append(dt, dd);
+  }
+  dl.append(dnode('dt', 'strong', copy.dayTotal));
+  dl.append(dnode('dd', 'strong', formatDayTokens(payload.today.total, locale)));
+  section.append(dl);
+  return section;
+};
+
+const dayHourlyBlock = (payload: DayPayload): HTMLElement => {
+  const section = dnode('section', 'dsection');
+  section.append(dnode('h3', null, copy.dayHourly));
+  const chart = dnode('div', 'chart');
+  const max = Math.max(...payload.hours, 1);
+  for (let hour = 0; hour < 24; hour += 1) {
+    const column = dnode('div', 'col');
+    const value = payload.hours[hour] ?? 0;
+    const fill = dnode('div', 'fill');
+    fill.style.height = `${dayShare(value, max)}%`;
+    column.append(fill);
+    column.title = `${String(hour).padStart(2, '0')}:00 · ${formatDayTokens(value, locale)}`;
+    chart.append(column);
+  }
+  section.append(chart);
+  const axis = dnode('div', 'axis');
+  for (const hour of [0, 6, 12, 18, 23]) {
+    const mark = dnode('span', null, `${String(hour).padStart(2, '0')}:00`);
+    mark.style.left = `${(hour / 23) * 100}%`;
+    axis.append(mark);
+  }
+  section.append(axis);
+  return section;
+};
+
+const dayRankBlock = (title: string, rows: Array<{ label: string; value: number }>): HTMLElement | null => {
+  if (rows.length === 0) return null;
+  const section = dnode('section', 'dsection');
+  section.append(dnode('h3', null, title));
+  const max = Math.max(...rows.map((row) => row.value), 1);
+  for (const row of rows) {
+    const line = dnode('div', 'rank');
+    const name = dnode('span', 'rank-name', row.label);
+    const track = dnode('span', 'rank-track');
+    const fill = dnode('i', null);
+    fill.style.width = `${dayShare(row.value, max)}%`;
+    track.append(fill);
+    const value = dnode('span', 'rank-val', formatDayTokens(row.value, locale));
+    line.append(name, track, value);
+    section.append(line);
+  }
+  return section;
+};
+
+const renderDay = (payload: DayPayload | null, message: string | null = null): void => {
+  dayPayload = payload;
+  dayNotice = message;
+  clearDayBody();
+  dayTitleEl.textContent = copy.dayTitle;
+  dayUnitEl.textContent = copy.dayUnit;
+  daySub.textContent = '';
+  dayFoot.textContent = '';
+  if (message && !payload) {
+    dayBig.textContent = '—';
+    dayBig.className = 'dbig muted';
+    dayDateEl.textContent = '';
+    daySub.textContent = message;
+    return;
+  }
+  if (!payload) {
+    dayBig.textContent = '—';
+    dayBig.className = 'dbig muted';
+    dayDateEl.textContent = '';
+    daySub.textContent = copy.dayLoading;
+    return;
+  }
+  dayDateEl.textContent = `${formatDayDate(payload.day, locale)} · ${copy.dayUpdated} ${formatDayClock(payload.updatedAt)}`;
+  const statusBits: string[] = [];
+  if (payload.refreshing) statusBits.push(copy.dayRefreshing);
+  if (payload.today.messages > 0) {
+    statusBits.push(`${formatDayCount(payload.today.messages, locale)} ${copy.dayTurns}`);
+  }
+  if (payload.scan.partial) statusBits.push(copy.dayPartial);
+  daySub.textContent = statusBits.join(' · ');
+  if (payload.error) {
+    dayBig.textContent = '—';
+    dayBig.className = 'dbig muted';
+    const banner = dnode('div', 'dbanner', copy.dayFailed);
+    banner.title = payload.error;
+    dayBody.append(banner);
+    return;
+  }
+  dayBig.textContent = formatDayTokens(payload.today.total, locale);
+  dayBig.className = payload.today.total > 0 ? 'dbig' : 'dbig muted';
+  if (payload.today.total === 0) {
+    dayBody.append(dnode('div', 'dempty', copy.dayZero));
+    return;
+  }
+  dayBody.append(dayDetailBlock(payload), dayHourlyBlock(payload));
+  const models = dayRankBlock(copy.dayModels, payload.models.map((row) => ({
+    label: row.model,
+    value: row.total,
+  })));
+  if (models) dayBody.append(models);
+  const sessions = dayRankBlock(copy.daySessions, payload.sessions.map((row) => ({
+    label: row.title || row.id,
+    value: row.total,
+  })));
+  if (sessions) dayBody.append(sessions);
+  dayFoot.textContent = [
+    copy.dayNote,
+    `${copy.dayScanned} ${formatDayCount(payload.scan.sessions, locale)} ${copy.daySessionsUnit}`,
+    `${formatDayCount(payload.scan.messages, locale)} ${copy.dayMessagesUnit}`,
+  ].join(' · ');
+};
+
+/** One read when the frame mounts; every later change is pushed on `day`. */
+const readDay = async (): Promise<void> => {
+  try {
+    const result = await host.serviceRequest({ method: 'GET', path: '/day' });
+    if (result.status >= 400) {
+      renderDay(null, `HTTP ${result.status}`);
+      return;
+    }
+    renderDay(JSON.parse(result.body) as DayPayload, null);
+  } catch (error) {
+    renderDay(null, describeError(error));
+  }
+};
 
 const resolveOrigin = (): string | null => {
   try {
@@ -291,6 +620,8 @@ const paintCache = (info: CacheInfo | null | undefined): void => {
 };
 
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
+  lastRate = rate;
+  applyOptions();
   if (!rate) {
     refresh.setActive(false);
     spark.update(null);
@@ -413,6 +744,17 @@ const poll = async (): Promise<void> => {
       // until this page's watch(null) lands, the service may still answer for
       // a session some other page watched.
       render(sessionId === null && rate.sessionId !== null ? withoutSession(rate) : rate);
+      // A restarted service remembers no watch (and no pushed day snapshots):
+      // re-assert it and take one day snapshot, at most once a second.
+      if ((rate.sessionId ?? null) !== (sessionId ?? null)) {
+        const now = Date.now();
+        if (now - lastReassertAt >= 1_000) {
+          lastReassertAt = now;
+          configuredKey = '';
+          void readDay();
+          await configure(sessionId);
+        }
+      }
     } else render(null, `HTTP ${result.status}`);
   } catch (error) {
     if (refresh.visible && requestedSession === sessionId) render(null, describeError(error));
@@ -446,6 +788,8 @@ const relabel = (): void => {
   });
   view.text(titleEl, copy.title);
   view.text(unitLine, copy.unit);
+  optionLabels();
+  renderDay(dayPayload, dayNotice);
 };
 
 const refresh = createRefreshLoop(root, poll, (visible) => {
@@ -453,15 +797,44 @@ const refresh = createRefreshLoop(root, poll, (visible) => {
   dot.style.animationPlayState = visible ? 'running' : 'paused';
 });
 
+/** The optional blocks; both surfaces follow the service, never their own copy. */
+const readOptions = async (): Promise<void> => {
+  try {
+    const result = await host.serviceRequest({ method: 'GET', path: '/options' });
+    if (result.status < 400) options = optionsFrom(JSON.parse(result.body));
+  } catch {
+    // Keep the defaults; the service may not be up yet.
+  }
+  applyOptions();
+  render(lastRate);
+};
+
 const mount = (): void => {
   relabel();
-  root.append(titleEl, stateLine, bigEl, unitLine, sparkEl, cacheBlock, list, noteEl);
+  applyOptions();
+  root.append(titleEl, optionsBar, stateLine, bigEl, unitLine, sparkEl, cacheBlock, list, noteEl, dayBlock);
+  host.onServiceEvent((event) => {
+    if (event.topic === 'options') {
+      const next = optionsFrom(event.data);
+      const dayWasOff = !options.day;
+      options = next;
+      applyOptions();
+      render(lastRate);
+      if (dayWasOff && options.day) void readDay();
+      return;
+    }
+    if (event.topic !== 'day' || !event.data || typeof event.data !== 'object') return;
+    renderDay(event.data as unknown as DayPayload, null);
+  });
   void configure(sessionId);
+  void readOptions();
+  void readDay();
   refresh.start();
 };
 
 host.onReady((next) => {
-  copy = next.locale.toLowerCase().startsWith('zh') ? COPY.zh : COPY.en;
+  locale = localeFromTag(next.locale);
+  copy = COPY[locale];
   applyHostReady(next, document.documentElement);
   sessionId = next.session?.id ?? null;
   origin = resolveOrigin();
@@ -471,6 +844,7 @@ host.onReady((next) => {
     mount();
     return;
   }
+  renderDay(dayPayload, dayNotice);
   void configure(sessionId);
   refresh.wake();
 });

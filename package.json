@@ -1,10 +1,10 @@
 {
   "name": "openchamber-live-tps",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "OpenChamber Work Status section: instant live TPS with sparkline, last-turn average, and TTFT.",
+  "description": "OpenChamber Work Status section: instant live TPS with sparkline, last-turn average, TTFT, and the day's provider-reported token usage.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wwwzzzxxx/openchamber-live-tps.git"
@@ -20,24 +20,27 @@
     "tps",
     "throughput",
     "latency",
-    "status-panel"
+    "status-panel",
+    "tokens-per-day",
+    "token-usage",
+    "daily-tokens"
   ],
   "openchamber": {
     "apiVersion": 1,
     "engines": {
-      "openchamber": ">=2.0.4"
+      "openchamber": ">=2.7.0"
     },
     "contributes": {
       "panel": {
         "id": "live-tps",
-        "name": "Live TPS",
+        "name": "TPS & Token",
         "icon": "pulse",
         "entry": "panel/index.html"
       },
       "statusSection": {
         "entry": "status/index.html",
-        "title": "Live TPS",
-        "height": 64
+        "title": "TPS · Token",
+        "height": 120
       },
       "service": {
         "entry": "service/main.js",
@@ -62,7 +65,7 @@
     "test": "node scripts/smoke.mjs && node scripts/regressions.mjs && node scripts/page-smoke.mjs && node scripts/cache.mjs"
   },
   "dependencies": {
-    "@openchamber/sdk": "2.0.4"
+    "@openchamber/sdk": "2.7.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.3"

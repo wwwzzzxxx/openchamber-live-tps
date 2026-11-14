@@ -109,6 +109,14 @@ const TOKENS = {
 
 /** The number a fixed page must paint once the fake host answers `/rate`. */
 const LIVE_TPS = 42.5;
+const HOUR = 3_600_000;
+const OPTIONS_ON = { cache: true, day: true, detail: true };
+const OPTIONS_OFF = { cache: false, day: false, detail: false };
+const DAY_START = (() => {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+})();
 const RATE = {
   connection: 'live',
   error: null,
@@ -151,7 +159,7 @@ const RATE = {
 };
 
 /** Run one built bundle in a fake frame and collect what it posts to its host. */
-const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE } = {}) => {
+const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', busy: false }, rate = RATE, options = OPTIONS_ON } = {}) => {
   const source = fs.readFileSync(path.join(ROOT, bundle), 'utf8');
   const stats = makeStats();
   let clock = 0;
@@ -270,6 +278,12 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
       } else if (request.payload?.path?.startsWith('/rate') && (!holdRates || rateOverride)) {
         replied.add(request.id);
         reply(request, { status: 200, body: JSON.stringify(rateOverride ?? rate) });
+      } else if (request.payload?.path === '/day') {
+        replied.add(request.id);
+        reply(request, { status: 200, body: JSON.stringify(DAY) });
+      } else if (request.payload?.path === '/options') {
+        replied.add(request.id);
+        reply(request, { status: 200, body: JSON.stringify(options) });
       }
     }
   };
@@ -288,6 +302,7 @@ const runGuest = (bundle, href, { session = { id: SESSION, title: 'page smoke', 
     setRate: (next) => { rate = next; },
     holdRates: (next) => { holdRates = next; },
     replyRatesWith: (next) => replyPending(next),
+    pushServiceEvent: (topic, data) => dispatch({ channel, v: version, type: 'service-event', payload: { topic, data } }),
     setDocumentHidden: (hidden) => { document.hidden = hidden; event('visibilitychange'); },
     setIntersecting: (visible) => {
       for (const observer of observers) observer.callback([{ target: observer.target, isIntersecting: visible, intersectionRatio: visible ? 1 : 0 }]);
@@ -339,6 +354,36 @@ const findByText = (node, text) => {
   return null;
 };
 
+const DAY = {
+  ok: true,
+  day: '2026-11-07',
+  dayStart: DAY_START,
+  updatedAt: DAY_START + 10 * HOUR,
+  refreshing: false,
+  stale: false,
+  error: null,
+  today: {
+    input: 1_973_524,
+    output: 220_433,
+    reasoning: 319_563,
+    cacheRead: 111_932_144,
+    cacheWrite: 0,
+    total: 114_445_664,
+    cost: 1.85,
+    messages: 871,
+  },
+  hours: Array.from({ length: 24 }, (_, hour) => (hour === 8 ? 42_106_190 : hour === 9 ? 11_163_578 : 0)),
+  models: [
+    { key: 'amr-link/deepseek-v4.1-flash', provider: 'amr-link', model: 'deepseek-v4.1-flash', total: 88_000_000, output: 137_295, messages: 444 },
+    { key: 'amr-link/deepseek-v4.1-flash-eco', provider: 'amr-link', model: 'deepseek-v4.1-flash-eco', total: 26_000_000, output: 28_784, messages: 60 },
+  ],
+  sessions: [
+    { id: 'ses_a', title: '基因组项目受阻', total: 35_099_172, output: 79_336, messages: 201 },
+    { id: 'ses_b', title: '当前公共区域', total: 5_185_206, output: 20_282, messages: 55 },
+  ],
+  scan: { sessions: 9, messages: 504, partial: false },
+};
+
 const SURFACES = [
   { name: 'status', bundle: 'status/main.js', url: 'http://127.0.0.1:28888/status/index.html' },
   { name: 'panel', bundle: 'panel/main.js', url: 'http://127.0.0.1:28888/panel/index.html' },
@@ -355,6 +400,17 @@ for (const surface of SURFACES) {
   check(`${surface.name}: an http page names its origin`, directBody?.origin === 'http://127.0.0.1:28888', JSON.stringify(directBody));
   check(`${surface.name}: an http page still shows the live number`, direct.root().includes(String(LIVE_TPS)), JSON.stringify(direct.root()));
   check(`${surface.name}: an http page never says it cannot reach the server`, !NO_ORIGIN_COPY.some((copy) => direct.root().includes(copy)), JSON.stringify(direct.root()));
+  check(`${surface.name}: the daily block shows today's total`, direct.root().includes('1.1亿'), JSON.stringify(direct.root().slice(-400)));
+  check(`${surface.name}: the daily block names the cache reads`, direct.root().includes('缓存读取'), JSON.stringify(direct.root().slice(-400)));
+  check(`${surface.name}: the daily block names itself`, direct.root().includes(surface.name === 'status' ? '今日' : '今日 Token'), JSON.stringify(direct.root().slice(0, 200)));
+  const dayRequests = direct.posted.filter((message) => message.type === 'service-request' && message.payload?.path === '/day').length;
+  direct.pushServiceEvent('day', { ...DAY, today: { ...DAY.today, total: 220_000_000, cacheRead: 210_000_000 }, updatedAt: DAY_START + 11 * HOUR });
+  await direct.flush();
+  check(`${surface.name}: a pushed day snapshot repaints the total`, direct.root().includes('2.2亿'), JSON.stringify(direct.root().slice(-400)));
+  check(`${surface.name}: a pushed day snapshot needs no poll`, direct.posted.filter((message) => message.type === 'service-request' && message.payload?.path === '/day').length === dayRequests, JSON.stringify(direct.posted.filter((m) => m.type === 'service-request').map((m) => m.payload?.path)));
+  direct.pushServiceEvent('not-day', { today: { total: 1 } });
+  await direct.flush();
+  check(`${surface.name}: other topics do not repaint the day`, direct.root().includes('2.2亿'), JSON.stringify(direct.root().slice(-400)));
   const settledValue = findByText(direct.rootEl, String(LIVE_TPS));
   check(
     `${surface.name}: an idle kept number is drawn stale, not live`,
@@ -541,6 +597,25 @@ for (const surface of SURFACES) {
   await stalled.advance(100);
   check(`${surface.name}: a recovered service starts the curve again`, stalled.stats.pathWrites > 0, JSON.stringify(stalled.stats));
 }
+
+// A fresh install shows the waveform alone; the blocks below it are opt-in.
+const bareStatus = runGuest('status/main.js', SURFACES[0].url, { options: OPTIONS_OFF });
+await bareStatus.flush();
+check('status: the default view keeps the rate', bareStatus.root().includes(String(LIVE_TPS)), JSON.stringify(bareStatus.root()));
+check('status: the default view hides the daily block', !bareStatus.root().includes('今日'), JSON.stringify(bareStatus.root()));
+check('status: the default view hides the cache lines', !bareStatus.root().includes('缓存读取'), JSON.stringify(bareStatus.root()));
+check('status: the default view hides the turn detail', !bareStatus.root().includes('上轮均值'), JSON.stringify(bareStatus.root()));
+bareStatus.pushServiceEvent('options', OPTIONS_ON);
+await bareStatus.flush();
+check('status: turning the blocks on repaints them', bareStatus.root().includes('今日') && bareStatus.root().includes('缓存读取'), JSON.stringify(bareStatus.root()));
+
+const barePanel = runGuest('panel/main.js', SURFACES[1].url, { options: OPTIONS_OFF });
+await barePanel.flush();
+check('panel: the default view hides today', findByClass(barePanel.rootEl, 'dayblock').hidden === true, JSON.stringify(barePanel.root().slice(0, 300)));
+check('panel: the default view keeps the rate', barePanel.root().includes(String(LIVE_TPS)), JSON.stringify(barePanel.root().slice(0, 300)));
+barePanel.pushServiceEvent('options', OPTIONS_ON);
+await barePanel.flush();
+check('panel: turning the blocks on repaints them', findByClass(barePanel.rootEl, 'dayblock').hidden === false, JSON.stringify(barePanel.root().slice(-300)));
 
 console.log(failures === 0 ? '\nALL PAGE SMOKE TESTS PASSED' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

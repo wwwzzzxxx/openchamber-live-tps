@@ -5,3 +5,7 @@ shell-marker.txt
 # still shows numbers. Never tracked — a git install must stay clean.
 .live-tps-state.json
 .live-tps-state.json.*.tmp
+.live-tps-day.json
+.live-tps-day.json.*.tmp
+.live-tps-options.json
+.live-tps-options.json.*.tmp

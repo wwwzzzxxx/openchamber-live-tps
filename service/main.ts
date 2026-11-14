@@ -24,7 +24,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createServiceHost } from '@openchamber/sdk';
 import { tokensFromChars } from '../shared/tokens';
+import { createDayLedger } from './day-ledger';
 import { passwordAuthHeaders } from './auth';
 
 const execFileAsync = promisify(execFile);
@@ -549,6 +551,97 @@ let busy = false;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
 let retryDelay = RETRY_BASE_MS;
+
+/** Where today's token ledger lives; beside the service, like the TPS state. */
+const dayStatePath = (): string => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_DAY_STATE;
+  if (override) return override;
+  // A test that points the TPS state at a scratch file gets the day ledger
+  // beside it for free, so no run can write into the repository.
+  const tpsOverride = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  if (tpsOverride) return `${tpsOverride}.day.json`;
+  const entry = process.argv[1];
+  const beside = entry ? path.dirname(entry) : process.cwd();
+  return path.join(beside, '.live-tps-day.json');
+};
+
+/** The server the ledger reads history from, once anything has named it. */
+const dayOrigin = (): string | null => serverOrigin ?? watch?.origin ?? desktopOrigin();
+
+/** The service side of the host callback: frames hear `day` snapshots through it. */
+const serviceHost = createServiceHost({ env: process.env });
+
+/** Which optional blocks the frames draw. The waveform itself is always on. */
+type ViewOptions = { cache: boolean; day: boolean; detail: boolean };
+
+const optionDefaults: ViewOptions = { cache: false, day: false, detail: false };
+
+const optionsPath = (): string => {
+  const override = process.env.OPENCHAMBER_LIVE_TPS_OPTIONS;
+  if (override) return override;
+  const tpsOverride = process.env.OPENCHAMBER_LIVE_TPS_STATE;
+  if (tpsOverride) return `${tpsOverride}.options.json`;
+  const entry = process.argv[1];
+  const beside = entry ? path.dirname(entry) : process.cwd();
+  return path.join(beside, '.live-tps-options.json');
+};
+
+const readOptions = (): ViewOptions => {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(optionsPath(), 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ...optionDefaults };
+    const saved = raw as Record<string, unknown>;
+    return {
+      cache: saved.cache === true,
+      day: saved.day === true,
+      detail: saved.detail === true,
+    };
+  } catch {
+    return { ...optionDefaults };
+  }
+};
+
+const writeOptions = (next: ViewOptions): void => {
+  const file = optionsPath();
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next));
+    fs.renameSync(tmp, file);
+  } catch {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // Nothing to clean up.
+    }
+  }
+};
+
+let options: ViewOptions = readOptions();
+
+const emitOptions = (): void => {
+  void serviceHost
+    .emit('options', options as unknown as Parameters<typeof serviceHost.emit>[1])
+    .catch(() => undefined);
+};
+
+const day = createDayLedger({
+  statePath: dayStatePath,
+  origin: dayOrigin,
+  headers: serverHeaders,
+  emit: (payload) => {
+    // The ledger keeps counting in memory, but nothing reaches the frames
+    // while the block is switched off.
+    if (!options.day) return;
+    void serviceHost
+      .emit('day', payload as unknown as Parameters<typeof serviceHost.emit>[1])
+      .catch(() => undefined);
+  },
+});
+
+/** Start (or skip) the day's history read once the feature is wanted. */
+const catchUpIfDay = (): void => {
+  if (options.day) void day.catchUp({ full: false });
+};
 
 // The turn in progress. A turn spans `session.execution.started` until
 // `session.execution.succeeded` / `failed`, but its average is built per
@@ -1534,6 +1627,10 @@ const eventSessionID = (event: RawEvent): string | null => {
 const handleEvent = (event: RawEvent, now: number): void => {
   const sessionId = eventSessionID(event);
   const type = normType(readString(event.type));
+  // The daily ledger counts every session, not only the watched one; it reads
+  // the same settled `tokens`/`cost` this stream already carries. Switched off
+  // by default, so the unconfigured extension does no daily accounting.
+  if (options.day) day.observe(type, event, now);
   if (sessionId && type === 'session.created') {
     // The stream announces every session with its parent, including the
     // subagent sessions a turn spawns below the watched one.
@@ -2332,6 +2429,9 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
     lastEventAt = Date.now();
     eventsSeen = 0;
     resetInFlight();
+    // A connect after a drop is the gap: read only messages newer than each
+    // session's saved cursor. A first connect only reads a fresh day once.
+    catchUpIfDay();
 
     try {
       const decoder = new TextDecoder();
@@ -2667,6 +2767,7 @@ const server = http.createServer((req, res) => {
       // longer implies the stream was rebuilt — only an origin change does.
       const fresh = sessionId !== null && !watched.has(sessionId);
       const changed = applyWatch({ origin, sessionId }) || fresh;
+      if (changed) catchUpIfDay();
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
@@ -2686,6 +2787,48 @@ const server = http.createServer((req, res) => {
       .catch((error: unknown) => {
         json(res, 400, { ok: false, error: error instanceof Error ? error.message : 'bad body' });
       });
+    return;
+  }
+
+  if (url.pathname === '/options') {
+    if (req.method === 'GET') {
+      json(res, 200, options);
+      return;
+    }
+    if (req.method === 'POST') {
+      void readJsonBody(req).then((raw) => {
+        const body = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+        const wasDay = options.day;
+        const next: ViewOptions = {
+          cache: typeof body.cache === 'boolean' ? body.cache : options.cache,
+          day: typeof body.day === 'boolean' ? body.day : options.day,
+          detail: typeof body.detail === 'boolean' ? body.detail : options.detail,
+        };
+        options = next;
+        writeOptions(options);
+        if (!wasDay && options.day) catchUpIfDay();
+        // Frames of both surfaces follow without polling for the change.
+        emitOptions();
+        json(res, 200, options);
+      }).catch((error: unknown) => {
+        json(res, 400, { error: error instanceof Error ? error.message : 'invalid options' });
+      });
+      return;
+    }
+    json(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  if (url.pathname === '/day') {
+    // Read-only snapshot for a frame that just mounted; every later change is
+    // pushed on the `day` service-event topic.
+    json(res, 200, day.snapshot(Date.now()));
+    return;
+  }
+
+  if (url.pathname === '/day/rebuild' && req.method === 'POST') {
+    day.rebuild();
+    json(res, 200, { ok: true });
     return;
   }
 
@@ -2765,6 +2908,7 @@ const server = http.createServer((req, res) => {
 });
 
 readPersisted();
+catchUpIfDay();
 server.listen(port, '127.0.0.1', () => {
   // `service.keepRunning` starts this process with the host, not with a page.
   // Subscribe immediately so background counting begins before anyone opens
@@ -2774,6 +2918,7 @@ server.listen(port, '127.0.0.1', () => {
 
 const shutdown = (): void => {
   flushPersist();
+  day.flush();
   stopStream();
   server.close(() => process.exit(0));
 };

@@ -3,10 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Live TPS</title>
+<title>TPS &amp; Token</title>
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; padding: 0; }
   body {
     font-family: var(--oc-font, system-ui, "Microsoft YaHei", sans-serif);
@@ -83,6 +84,107 @@
   .delta.down { color: var(--oc-error, #f66); }
   @keyframes pulse { 50% { opacity: 0.35; } }
   .note { margin-top: 12px; color: var(--oc-muted, #888); font-size: 0.786rem; }
+
+  /* --- the daily-token block (same numbers the status line carries) --- */
+  .dayblock {
+    margin-top: 18px;
+    padding-top: 12px;
+    border-top: 1px solid var(--oc-border, rgba(128, 128, 128, 0.25));
+  }
+  .dhead { display: flex; align-items: baseline; gap: 8px; }
+  .dhead h2 { font-size: 0.929rem; margin: 0; font-weight: 650; color: var(--oc-fg, inherit); }
+  .ddate {
+    margin-left: auto;
+    color: var(--oc-muted, #888);
+    font-size: 0.786rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .dbigrow { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; }
+  .dbig {
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 1.857rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .dbig.muted { color: var(--oc-muted, #888); font-size: 1.286rem; font-weight: 500; }
+  .dunit { color: var(--oc-muted, #888); }
+  .dsub { color: var(--oc-muted, #888); font-size: 0.786rem; min-height: 1.6em; }
+  .dsection { margin-top: 12px; }
+  .dsection h3 {
+    font-size: 0.786rem;
+    font-weight: 600;
+    color: var(--oc-muted, #888);
+    margin: 0 0 6px;
+  }
+  dl.detail {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px 12px;
+    margin: 0;
+  }
+  dl.detail dt { color: var(--oc-muted, #888); }
+  dl.detail dd {
+    margin: 0;
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  dl.detail dt.strong, dl.detail dd.strong { color: var(--oc-fg, inherit); font-weight: 650; }
+  .share { color: var(--oc-muted, #888); font-size: 0.714rem; margin-left: 6px; }
+  .chart { display: flex; align-items: flex-end; gap: 2px; height: 56px; }
+  .chart .col { flex: 1; height: 100%; display: flex; align-items: flex-end; min-width: 0; }
+  .chart .fill {
+    width: 100%;
+    background: var(--oc-primary, #888);
+    opacity: 0.85;
+    border-radius: 2px 2px 0 0;
+    min-height: 0;
+  }
+  .axis { position: relative; height: 13px; margin-top: 2px; }
+  .axis span {
+    position: absolute;
+    transform: translateX(-50%);
+    font-size: 0.643rem;
+    color: var(--oc-muted, #888);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rank {
+    display: grid;
+    grid-template-columns: minmax(60px, 34%) 1fr auto;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .rank-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.786rem; }
+  .rank-track {
+    background: var(--oc-subtle, rgba(128, 128, 128, 0.18));
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    display: block;
+  }
+  .rank-track i { display: block; height: 100%; background: var(--oc-primary, #888); border-radius: 3px; }
+  .rank-val {
+    font-family: var(--oc-mono, ui-monospace, Consolas, monospace);
+    font-size: 0.786rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--oc-muted, #888);
+  }
+  .opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 2px 0 8px;
+    font-size: 0.786rem;
+    color: var(--oc-muted, #888);
+  }
+  .opt { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .opt input { margin: 0; accent-color: var(--oc-primary, #6af); }
+  .dempty, .dbanner { margin-top: 12px; font-size: 0.786rem; color: var(--oc-muted, #888); }
+  .dbanner { color: var(--oc-error, #d44); }
+  .dfoot { margin-top: 12px; font-size: 0.714rem; line-height: 1.5; color: var(--oc-muted, #888); }
 </style>
 </head>
 <body>
